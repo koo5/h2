@@ -1,0 +1,51 @@
+[project]
+name = "hillview-api"
+version = "1.0.0"
+description = "Hillview API backend service"
+requires-python = ">=3.12"
+
+dependencies = [
+    # Shared utilities with all extras
+    "hillview-common[db,auth,cdn]",
+
+    # Core API
+    "fastapi",
+    "pydantic",
+    "uvicorn[standard]",
+    "python-multipart",
+    "aiofiles",
+
+    # HTTP clients
+    "requests",
+    "httpx[http2]",
+
+    # Database migrations
+    "alembic",
+    "psycopg2-binary",
+
+    # Push notifications
+    "firebase-admin==7.1.0",
+
+    # Config
+    "pyyaml",
+
+    # Self-hosted Swagger UI assets
+    "swagger-ui-py",
+
+    # IP geolocation (featured photo on first visit)
+    "geoip2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==9.0.3",
+    "pytest-asyncio>=1.0,<2",
+    "piexif",
+    "pillow",
+    "pyright>=1.1.350",
+    "aiohttp",
+    "pip-audit",
+]
+
+[tool.uv.sources]
+hillview-common = { workspace = true }

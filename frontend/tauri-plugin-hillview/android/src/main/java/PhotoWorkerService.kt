@@ -1,0 +1,811 @@
+package cz.hillview.plugin
+
+import android.content.Context
+import android.util.Log
+import kotlinx.coroutines.*
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.boolean
+import kotlinx.serialization.json.double
+import kotlinx.serialization.json.intOrNull
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.putJsonArray
+import kotlinx.serialization.json.putJsonObject
+import kotlinx.serialization.json.addJsonObject
+import kotlinx.serialization.json.put
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.decodeFromString
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
+
+// Explicit imports for type definitions
+import cz.hillview.plugin.WorkerMessage
+import cz.hillview.plugin.MessageType
+import cz.hillview.plugin.ConfigData
+import cz.hillview.plugin.ProcessId
+
+/**
+ * Photo Worker Service - Main orchestration class for Kotlin photo processing
+ *
+ * Provides single entry point for all photo operations with process management,
+ * prioritization, and aborting support.
+ *
+ * Communication design:
+ * - Single general-purpose Tauri command: processPhotos
+ * - Event-based responses (or polling fallback)
+ * - Maintains compatibility with existing frontend architecture
+ */
+class PhotoWorkerService(private val context: Context, private val plugin: ExamplePlugin? = null) {
+    companion object {
+        private const val TAG = "PhotoWorkerService"
+       	private const val doLog = false
+        private const val MAX_CONCURRENT_PROCESSES = 5
+
+        // Photo processing constants - should match photoWorkerConstants.ts
+        private const val MAX_PHOTOS_IN_AREA = 400
+        private const val MAX_PHOTOS_IN_RANGE = 200
+        private const val DEFAULT_RANGE_METERS = 1000.0
+    }
+
+    private val json = Json { ignoreUnknownKeys = true }
+    private val photoOperations = PhotoOperations(context)
+    private val cullingGrid = CullingGrid::class.java // Will be instantiated per request
+    private val angularRangeCuller = AngularRangeCuller()
+
+    // Process management
+    private val processTable = ConcurrentHashMap<ProcessId, ProcessInfo>()
+    private val activeProcesses = ConcurrentHashMap<ProcessId, Job>()
+    private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private var messageIdCounter = 0
+
+    // Persistent state like new.worker.ts currentState.sourcesPhotosInArea.data
+    private val sourcesPhotosInArea = ConcurrentHashMap<String, List<PhotoData>>()
+    @Volatile
+    private var currentPicks = setOf<String>()
+
+    // Store current sources, bounds, range and maxPhotos state like new.worker.ts
+    private var currentSources: List<SourceConfig> = emptyList()
+    private var lastProcessedBounds: Bounds? = null
+    private var lastProcessedRange: Double = DEFAULT_RANGE_METERS
+    private var currentMaxPhotosInArea: Int = MAX_PHOTOS_IN_AREA
+
+    /**
+     * Process info for tracking active operations
+     */
+    private data class ProcessInfo(
+        val processId: ProcessId,
+        val messageId: Int,
+        val priority: Priority,
+        val type: ProcessType,
+        val startTime: Long,
+        val abortFlag: AtomicBoolean = AtomicBoolean(false),
+        val cancellationScope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    )
+
+    /**
+     * Parse WorkerMessage manually to avoid serialization issues
+     */
+    private fun parseWorkerMessage(messageJson: String): WorkerMessage {
+        val jsonElement = json.parseToJsonElement(messageJson)
+        val jsonObject = jsonElement.jsonObject
+
+        val typeString = jsonObject["type"]?.jsonPrimitive?.content
+            ?: throw Exception("Missing 'type' field in WorkerMessage")
+        val type = MessageType.valueOf(typeString)
+
+        val messageId = jsonObject["messageId"]?.jsonPrimitive?.content?.toIntOrNull()
+            ?: throw Exception("Missing or invalid 'messageId' field in WorkerMessage")
+
+        val processId = jsonObject["processId"]?.jsonPrimitive?.content
+            ?: throw Exception("Missing 'processId' field in WorkerMessage")
+
+        val priority = jsonObject["priority"]?.jsonPrimitive?.content?.toIntOrNull()
+            ?: throw Exception("Missing or invalid 'priority' field in WorkerMessage")
+
+        val data = jsonObject["data"]?.jsonPrimitive?.content
+            ?: throw Exception("Missing 'data' field in WorkerMessage")
+
+        return WorkerMessage(
+            type = type,
+            messageId = messageId,
+            processId = processId,
+            priority = priority,
+            data = data
+        )
+    }
+
+    /**
+     * Parse ConfigData manually to avoid serialization issues
+     */
+    private fun parseConfigData(dataJson: String): ConfigData {
+        val jsonElement = json.parseToJsonElement(dataJson)
+        val jsonObject = jsonElement.jsonObject
+
+        val sourcesArray = jsonObject["sources"]?.jsonArray
+            ?: throw Exception("Missing 'sources' field in ConfigData")
+
+        val sources = sourcesArray.map { sourceElement ->
+            val sourceObj = sourceElement.jsonObject
+            SourceConfig(
+                id = sourceObj["id"]?.jsonPrimitive?.content ?: "",
+                name = sourceObj["name"]?.jsonPrimitive?.content ?: "",
+                type = sourceObj["type"]?.jsonPrimitive?.content ?: "",
+                enabled = sourceObj["enabled"]?.jsonPrimitive?.boolean ?: false,
+                color = sourceObj["color"]?.jsonPrimitive?.content ?: "#000",
+                url = sourceObj["url"]?.jsonPrimitive?.content,
+                subtype = sourceObj["subtype"]?.jsonPrimitive?.content,
+                requests = sourceObj["requests"]?.jsonArray?.map { it.jsonPrimitive.content } ?: emptyList()
+            )
+        }
+
+        val expectedWorkerVersion = jsonObject["expectedWorkerVersion"]?.jsonPrimitive?.content
+
+        return ConfigData(
+            sources = sources,
+            expectedWorkerVersion = expectedWorkerVersion,
+            queryOptionsJson = jsonObject["queryOptionsJson"]?.jsonPrimitive?.content,  // Pre-serialized string
+            maxPhotosInArea = jsonObject["maxPhotosInArea"]?.jsonPrimitive?.intOrNull
+        )
+    }
+
+    /**
+     * Parse AreaData manually to avoid serialization issues
+     */
+    private fun parseAreaData(dataJson: String): AreaData {
+        val jsonElement = json.parseToJsonElement(dataJson)
+        val jsonObject = jsonElement.jsonObject
+
+        val sourcesArray = jsonObject["sources"]?.jsonArray
+            ?: throw Exception("Missing 'sources' field in AreaData")
+
+        val sources = sourcesArray.map { sourceElement ->
+            val sourceObj = sourceElement.jsonObject
+            SourceConfig(
+                id = sourceObj["id"]?.jsonPrimitive?.content ?: "",
+                name = sourceObj["name"]?.jsonPrimitive?.content ?: "",
+                type = sourceObj["type"]?.jsonPrimitive?.content ?: "",
+                enabled = sourceObj["enabled"]?.jsonPrimitive?.boolean ?: false,
+                color = sourceObj["color"]?.jsonPrimitive?.content ?: "#000",
+                url = sourceObj["url"]?.jsonPrimitive?.content,
+                subtype = sourceObj["subtype"]?.jsonPrimitive?.content,
+                requests = sourceObj["requests"]?.jsonArray?.map { it.jsonPrimitive.content } ?: emptyList()
+            )
+        }
+
+        val boundsObj = jsonObject["bounds"]?.jsonObject
+            ?: throw Exception("Missing 'bounds' field in AreaData")
+
+        val topLeftObj = boundsObj["top_left"]?.jsonObject
+            ?: throw Exception("Missing 'top_left' in bounds")
+        val bottomRightObj = boundsObj["bottom_right"]?.jsonObject
+            ?: throw Exception("Missing 'bottom_right' in bounds")
+
+        val bounds = Bounds(
+            top_left = LatLng(
+                lat = topLeftObj["lat"]?.jsonPrimitive?.double ?: 0.0,
+                lng = topLeftObj["lng"]?.jsonPrimitive?.double ?: 0.0
+            ),
+            bottom_right = LatLng(
+                lat = bottomRightObj["lat"]?.jsonPrimitive?.double ?: 0.0,
+                lng = bottomRightObj["lng"]?.jsonPrimitive?.double ?: 0.0
+            )
+        )
+
+        val maxPhotos = jsonObject["maxPhotos"]?.jsonPrimitive?.intOrNull
+            ?: throw Exception("Missing or invalid 'maxPhotos' field in AreaData")
+
+        val range = jsonObject["range"]?.jsonPrimitive?.content?.toDoubleOrNull()
+            ?: DEFAULT_RANGE_METERS // Default range if not provided
+
+        val generation = jsonObject["generation"]?.jsonPrimitive?.intOrNull
+
+        return AreaData(
+            sources = sources,
+            bounds = bounds,
+            maxPhotos = maxPhotos,
+            range = range,
+            queryOptionsJson = jsonObject["queryOptionsJson"]?.jsonPrimitive?.content,  // Pre-serialized string
+            generation = generation
+        )
+    }
+
+    /**
+     * Main entry point - single general-purpose message processing
+     * Like new.worker.ts: immediate response + async processing with events
+     */
+    suspend fun processPhotos(
+        messageJson: String,
+        authTokenProvider: suspend () -> String?
+    ) {
+        try {
+            val message = parseWorkerMessage(messageJson)
+            if (doLog) Log.d(TAG, "PProcessing message type ${message.type} (${message.processId})")
+
+            when (message.type) {
+                MessageType.PROCESS_CONFIG -> {
+                    // Launch async processing like new.worker.ts
+                    serviceScope.launch {
+                        processConfigMessage(message, authTokenProvider)
+                    }
+                }
+                MessageType.PROCESS_AREA -> {
+                    // Launch async processing like new.worker.ts
+                    serviceScope.launch {
+                        processAreaMessage(message, authTokenProvider)
+                    }
+                }
+                MessageType.PICKS_UPDATED -> {
+                    // Update picks immediately like new.worker.ts
+                    val picksData = json.decodeFromString<PicksData>(message.data)
+                    currentPicks = picksData.picks.toSet()
+                    if (doLog) Log.d(TAG, "PhotoWorkerService: Updated picks to ${currentPicks.size} items")
+                }
+                MessageType.PANORAMAX_HIDDEN_INVALIDATE -> {
+                    // Drop the worker-side Panoramax hidden-content cache so the next area load
+                    // refetches it from /api/hidden/{photos,users}?…=panoramax.
+                    PanoramaxPhotoLoader.invalidateHidden()
+                    if (doLog) Log.d(TAG, "PhotoWorkerService: Invalidated Panoramax hidden cache")
+                }
+                MessageType.REMOVE_PHOTO -> {
+                    val data = json.decodeFromString<RemovePhotoData>(message.data)
+                    serviceScope.launch { handleRemovePhoto(data.photoId, data.source) }
+                }
+                MessageType.REMOVE_USER_PHOTOS -> {
+                    val data = json.decodeFromString<RemoveUserPhotosData>(message.data)
+                    serviceScope.launch { handleRemoveUserPhotos(data.userId, data.source) }
+                }
+                MessageType.ABORT_PROCESS -> {
+                    abortProcess(message.processId)
+                }
+                MessageType.ABORT_AREA -> {
+                    // Abort area and lower priority processes, leave config alone
+                    Log.d(TAG, "PhotoWorkerService: Aborting area and lower priority processes (map navigated away)")
+                    abortLowerPriorityProcesses(3) // 3 = config priority; aborts everything with priority < 3 (area=2 and below)
+                }
+                MessageType.CLEANUP -> {
+                    cleanup()
+                }
+            }
+
+        } catch (error: Exception) {
+            Log.e(TAG, "PhotoWorkerService: Error processing message", error)
+            // Send error event to frontend like new.worker.ts does
+            sendErrorEvent("Error processing message: ${error.message}")
+        }
+    }
+
+    /**
+     * Process config update - translation of worker's CONFIG message handling
+     */
+    private suspend fun processConfigMessage(
+        message: WorkerMessage,
+        authTokenProvider: suspend () -> String?
+    ) {
+        val config = parseConfigData(message.data)
+
+        // Abort any existing config processes to prevent stale results
+        abortSameTypeProcesses(ProcessType.CONFIG)
+        // Abort any existing lower priority processes
+        abortLowerPriorityProcesses(message.priority)
+
+        // Create process info
+        val processInfo = ProcessInfo(
+            processId = message.processId,
+            messageId = message.messageId,
+            priority = message.priority,
+            type = ProcessType.CONFIG,
+            startTime = System.currentTimeMillis()
+        )
+        processTable[message.processId] = processInfo
+
+        // Launch config processing in the process's own cancellable scope
+        val job = processInfo.cancellationScope.launch {
+            try {
+                // Store current sources state like new.worker.ts
+                currentSources = config.sources
+
+                // Update max photos in area if provided in config (like new.worker.ts lines 304-306)
+                config.maxPhotosInArea?.let {
+                    currentMaxPhotosInArea = it
+                    photoOperations.setMaxPhotosInArea(it)
+                }
+
+                // Update query options before processing
+                photoOperations.setQueryOptionsJson(config.queryOptionsJson)
+
+                // Implement selective clearing like new.worker.ts updatePhotosInArea callback
+                val enabledSourceIds = config.sources.filter { it.enabled }.map { it.id }.toSet()
+
+                // Remove photos from disabled sources (like new.worker.ts lines 253-258)
+                val sourcesToRemove = this@PhotoWorkerService.sourcesPhotosInArea.keys.filter { !enabledSourceIds.contains(it) }
+                sourcesToRemove.forEach { sourceId ->
+                    if (doLog) Log.d(TAG, "PhotoWorkerService: Clearing photos from disabled source: $sourceId")
+                    this@PhotoWorkerService.sourcesPhotosInArea.remove(sourceId)
+                }
+
+                // Send current photos (enabled sources remain visible, disabled sources cleared)
+                val allPhotos = this@PhotoWorkerService.sourcesPhotosInArea.values.flatten()
+                sendPhotosUpdate(allPhotos, this@PhotoWorkerService.sourcesPhotosInArea.toMap())
+
+            if (doLog) Log.d(TAG, "PhotoWorkerService: Config processing complete - kept ${allPhotos.size} photos from enabled sources")
+
+            // Trigger area update after config to ensure streaming sources load with current bounds
+            // This matches the behavior of simplePhotoWorker.ts lines 263-271
+            if (lastProcessedBounds != null) {
+                if (doLog) Log.d(TAG, "PhotoWorkerService: Queuing area update after config to load streaming sources...")
+
+                // Create area message like web worker does (goes through message queue and priority system)
+                // Build JSON manually to match existing pattern (parseAreaData expects this format)
+                val areaDataJson = buildJsonObject {
+                    putJsonArray("sources") {
+                        currentSources.forEach { source ->
+                            addJsonObject {
+                                put("id", source.id)
+                                put("type", source.type)
+                                put("enabled", source.enabled)
+                                put("url", source.url ?: "")
+                            }
+                        }
+                    }
+                    putJsonObject("bounds") {
+                        putJsonObject("top_left") {
+                            put("lat", lastProcessedBounds!!.top_left.lat)
+                            put("lng", lastProcessedBounds!!.top_left.lng)
+                        }
+                        putJsonObject("bottom_right") {
+                            put("lat", lastProcessedBounds!!.bottom_right.lat)
+                            put("lng", lastProcessedBounds!!.bottom_right.lng)
+                        }
+                    }
+                    put("maxPhotos", currentMaxPhotosInArea)
+                    put("range", lastProcessedRange)
+                    config.queryOptionsJson?.let { put("queryOptionsJson", it) }
+                }.toString()
+
+                val areaMessage = WorkerMessage(
+                    type = MessageType.PROCESS_AREA,
+                    messageId = ++messageIdCounter,
+                    processId = "auto_area_after_config_${System.currentTimeMillis()}",
+                    priority = 2, // Same priority as normal area updates
+                    data = areaDataJson
+                )
+
+                // Process through normal message handling (respects priority and queue)
+                serviceScope.launch {
+                    processAreaMessage(areaMessage, authTokenProvider)
+                }
+            }
+
+            } catch (error: Exception) {
+                Log.e(TAG, "PhotoWorkerService: Config processing error (${message.processId})", error)
+                // Send error event to frontend like new.worker.ts does
+                sendErrorEvent("Config processing error: ${error.message}")
+            } finally {
+                processTable.remove(message.processId)
+                activeProcesses.remove(message.processId)
+            }
+        }
+
+        // Store the job for potential cancellation
+        activeProcesses[message.processId] = job
+    }
+
+    /**
+     * Process area update - translation of worker's AREA message handling
+     */
+    private suspend fun processAreaMessage(
+        message: WorkerMessage,
+        authTokenProvider: suspend () -> String?
+    ) {
+        val areaData = parseAreaData(message.data)
+
+        // Abort any existing area processes to prevent stale results overwriting new ones
+        abortSameTypeProcesses(ProcessType.AREA)
+        // Abort any existing lower priority processes
+        abortLowerPriorityProcesses(message.priority)
+
+        // Create process info
+        val processInfo = ProcessInfo(
+            processId = message.processId,
+            messageId = message.messageId,
+            priority = message.priority,
+            type = ProcessType.AREA,
+            startTime = System.currentTimeMillis()
+        )
+        processTable[message.processId] = processInfo
+
+        // Launch area processing in the process's own cancellable scope
+        val job = processInfo.cancellationScope.launch {
+            try {
+                // Store current bounds and range for post-config area updates (like new.worker.ts)
+                lastProcessedBounds = areaData.bounds
+                lastProcessedRange = areaData.range
+
+                // Update picks and query options in photoOperations before processing area
+                photoOperations.setPicks(currentPicks)
+                photoOperations.setQueryOptionsJson(areaData.queryOptionsJson)
+
+                // Process area photos with per-source loading status callbacks
+                val sourcesPhotosInArea = photoOperations.processArea(
+                processId = message.processId,
+                sources = areaData.sources,
+                bounds = areaData.bounds,
+                shouldAbort = { processInfo.abortFlag.get() },
+                authTokenProvider = authTokenProvider,
+                onSourceLoadingStatus = { sourceId, isLoading, progress, error ->
+                    sendLoadingStatusEvent(sourceId, isLoading, progress, error)
+                }
+            )
+
+                if (!processInfo.abortFlag.get()) {
+                    // Update persistent state with new photos from area processing
+                    this@PhotoWorkerService.sourcesPhotosInArea.putAll(sourcesPhotosInArea)
+
+                    // Apply culling if photos exceed maxPhotos (picks are always included)
+                    val totalPhotos = this@PhotoWorkerService.sourcesPhotosInArea.values.sumOf { it.size }
+                    val finalPhotos = if (totalPhotos > areaData.maxPhotos) {
+                        if (doLog) Log.d(TAG, "PhotoWorkerService: Applying culling - $totalPhotos photos > ${areaData.maxPhotos} limit, picks: ${currentPicks.size}")
+
+                        val gridCuller = CullingGrid(areaData.bounds)
+                        val culledPhotos = gridCuller.cullPhotos(this@PhotoWorkerService.sourcesPhotosInArea.toMap(), areaData.maxPhotos, currentPicks)
+
+                        if (doLog) Log.d(TAG, "PhotoWorkerService: Grid culling complete - ${culledPhotos.size} photos selected")
+                        culledPhotos
+                    } else {
+                        this@PhotoWorkerService.sourcesPhotosInArea.values.flatten()
+                    }
+
+                    // Send photos update to frontend like new.worker.ts does
+                    sendPhotosUpdate(finalPhotos, this@PhotoWorkerService.sourcesPhotosInArea.toMap(), areaData.bounds, areaData.range, areaData.generation)
+                }
+
+            } catch (error: Exception) {
+                Log.e(TAG, "PhotoWorkerService: Area processing error (${message.processId})", error)
+
+                // Send error event to frontend like new.worker.ts does
+                sendErrorEvent("Area processing error: ${error.message}")
+            } finally {
+                processTable.remove(message.processId)
+                activeProcesses.remove(message.processId)
+            }
+        }
+
+        // Store the job for potential cancellation
+        activeProcesses[message.processId] = job
+    }
+
+    /**
+     * Process range culling - for user movement scenarios
+     * Uses currentPicks to ensure picked photos are always included
+     */
+    suspend fun processRangeCulling(
+        photos: List<PhotoData>,
+        center: LatLng,
+        range: Double,
+        maxPhotos: Int
+    ): List<PhotoData> {
+        return angularRangeCuller.cullPhotosInRange(photos, center, range, maxPhotos, currentPicks)
+    }
+
+    /**
+     * Abort a specific process with proper coroutine cancellation
+     */
+    private fun abortProcess(processId: ProcessId) {
+        if (doLog) Log.d(TAG, "PhotoWorkerService: Aborting process $processId")
+
+        val processInfo = processTable[processId]
+        if (processInfo != null) {
+            // Set abort flag for legacy shouldAbort() checks
+            processInfo.abortFlag.set(true)
+
+            // Cancel the process's coroutine scope properly
+            try {
+                processInfo.cancellationScope.cancel("Process $processId aborted by higher priority operation")
+                if (doLog) Log.d(TAG, "PhotoWorkerService: Cancelled coroutine scope for process $processId")
+            } catch (e: Exception) {
+                Log.w(TAG, "PhotoWorkerService: Error cancelling scope for process $processId: ${e.message}")
+            }
+        }
+
+        // Cancel any active coroutine job
+        activeProcesses[processId]?.cancel()
+
+        // Clean up tracking maps
+        activeProcesses.remove(processId)
+        processTable.remove(processId)
+
+        if (doLog) Log.d(TAG, "PhotoWorkerService: Process $processId cleanup complete")
+    }
+
+    /**
+     * Abort lower priority processes. Higher number = higher priority (matches web worker convention).
+     */
+    private fun abortLowerPriorityProcesses(newPriority: Priority) {
+        val processesToAbort = processTable.values.filter { it.priority < newPriority }
+
+        for (process in processesToAbort) {
+            if (doLog) Log.d(TAG, "PhotoWorkerService: Aborting lower priority process ${process.processId} (priority ${process.priority} < $newPriority)")
+            abortProcess(process.processId)
+        }
+    }
+
+    /**
+     * Abort all existing processes of the same type.
+     * Prevents stale results from an old area load overwriting a newer one.
+     */
+    private fun abortSameTypeProcesses(type: ProcessType, excludeProcessId: ProcessId? = null) {
+        val processesToAbort = processTable.values.filter { it.type == type && it.processId != excludeProcessId }
+
+        for (process in processesToAbort) {
+            Log.d(TAG, "PhotoWorkerService: Aborting same-type ${process.type} process ${process.processId}")
+            abortProcess(process.processId)
+        }
+    }
+
+    /** Filter a photo out of both the per-source culled state and the per-source
+     *  cache, then re-cull and push a fresh update to the frontend. Mirrors
+     *  removePhotoFromCache in new.worker.ts. */
+    private suspend fun handleRemovePhoto(photoId: String, sourceId: String) {
+        val current = sourcesPhotosInArea[sourceId] ?: return
+        val filtered = current.filterNot { it.id == photoId }
+        val cacheRemoved = photoOperations.removePhotoFromCache(photoId, sourceId)
+        if (filtered.size == current.size && !cacheRemoved) {
+            if (doLog) Log.d(TAG, "PhotoWorkerService: removePhoto $photoId@$sourceId — nothing to remove")
+            return
+        }
+        sourcesPhotosInArea[sourceId] = filtered
+        if (doLog) Log.d(TAG, "PhotoWorkerService: removed photo $photoId from $sourceId (${current.size - filtered.size} removed in view, cache hit=$cacheRemoved)")
+        emitPhotosUpdateAfterMutation()
+    }
+
+    /** Same as handleRemovePhoto but for every photo by a given creator id. */
+    private suspend fun handleRemoveUserPhotos(userId: String, sourceId: String) {
+        val current = sourcesPhotosInArea[sourceId] ?: return
+        val filtered = current.filterNot { it.creator?.id == userId }
+        val cacheRemoved = photoOperations.removeUserPhotosFromCache(userId, sourceId)
+        val removedFromView = current.size - filtered.size
+        if (removedFromView == 0 && cacheRemoved == 0) {
+            if (doLog) Log.d(TAG, "PhotoWorkerService: removeUserPhotos $userId@$sourceId — nothing to remove")
+            return
+        }
+        sourcesPhotosInArea[sourceId] = filtered
+        if (doLog) Log.d(TAG, "PhotoWorkerService: removed $removedFromView photos by $userId from $sourceId view, $cacheRemoved from cache")
+        emitPhotosUpdateAfterMutation()
+    }
+
+    /** Re-cull the current `sourcesPhotosInArea` snapshot against the
+     *  last-known area state and emit a `photosUpdate` event. Used by the
+     *  removePhoto / removeUserPhotos handlers, since the underlying state
+     *  changed but no new area load is being triggered. */
+    private suspend fun emitPhotosUpdateAfterMutation() {
+        val bounds = lastProcessedBounds
+        val snapshot = sourcesPhotosInArea.toMap()
+        val totalPhotos = snapshot.values.sumOf { it.size }
+        val finalPhotos = if (bounds != null && totalPhotos > currentMaxPhotosInArea) {
+            CullingGrid(bounds).cullPhotos(snapshot, currentMaxPhotosInArea, currentPicks)
+        } else {
+            snapshot.values.flatten()
+        }
+        sendPhotosUpdate(finalPhotos, snapshot, bounds, lastProcessedRange)
+    }
+
+    /**
+     * Send photos update to frontend via Tauri events (like new.worker.ts postMessage)
+     */
+    private suspend fun sendPhotosUpdate(
+        photos: List<PhotoData>,
+        sourcesPhotosInArea: Map<String, List<PhotoData>>,
+        bounds: Bounds? = null,
+        range: Double? = null,
+        generation: Int? = null
+    ) {
+        try {
+            // Apply angular range culling if bounds and range are available (picks are always included)
+            val photosInRange = if (bounds != null && range != null) {
+                val center = LatLng(
+                    lat = (bounds.top_left.lat + bounds.bottom_right.lat) / 2,
+                    lng = (bounds.top_left.lng + bounds.bottom_right.lng) / 2
+                )
+                val rangePhotos = angularRangeCuller.cullPhotosInRange(photos, center, range, MAX_PHOTOS_IN_RANGE, currentPicks).toMutableList()
+
+                // Sort photos in range by bearing for consistent navigation order (like new.worker.ts)
+                sortPhotosByBearing(rangePhotos)
+
+                rangePhotos
+            } else {
+                // For config updates without range info, use the photos as-is
+                photos
+            }
+
+            // Create photosUpdate message like new.worker.ts sends
+            val eventData = app.tauri.plugin.JSObject()
+            eventData.put("type", "photosUpdate")
+            eventData.put("photos_in_area", serializePhotoDataList(photos))
+            eventData.put("photos_in_range", serializePhotoDataList(photosInRange))
+            eventData.put("timestamp", System.currentTimeMillis())
+            generation?.let { eventData.put("generation", it) }
+            photoOperations.lastDeviceQueryStartedAt?.let { eventData.put("device_query_started_at", it) }
+
+            if (doLog) Log.d(TAG, "PhotoWorkerService: Queuing photosUpdate message with ${photos.size} area photos and ${photosInRange.size} range photos")
+
+            // Use message queue instead of direct event triggering
+            plugin?.queueMessage("photo-worker-update", eventData)
+
+        } catch (error: Exception) {
+            Log.e(TAG, "PhotoWorkerService: Error creating photos update message", error)
+        }
+    }
+
+    /**
+     * Send error event to frontend via Tauri events (like new.worker.ts postMessage error)
+     */
+    private fun sendErrorEvent(errorMessage: String) {
+        try {
+            // Create error message like new.worker.ts sends
+            val eventData = app.tauri.plugin.JSObject()
+            eventData.put("type", "error")
+            eventData.put("error", errorMessage)
+            eventData.put("timestamp", System.currentTimeMillis())
+
+            if (doLog) Log.d(TAG, "PhotoWorkerService: Queuing error message: $errorMessage")
+
+            // Use message queue instead of direct event triggering
+            plugin?.queueMessage("photo-worker-error", eventData)
+
+        } catch (error: Exception) {
+            Log.e(TAG, "PhotoWorkerService: Error creating error message", error)
+        }
+    }
+
+    /**
+     * Send loading status event to frontend via Tauri events (like StreamSourceLoader updateLoadingStatus)
+     */
+    private fun sendLoadingStatusEvent(sourceId: String, isLoading: Boolean, progress: String? = null, error: String? = null) {
+        try {
+            // Create loading status message like StreamSourceLoader sends
+            val eventData = app.tauri.plugin.JSObject()
+            eventData.put("source_id", sourceId)
+            eventData.put("is_loading", isLoading)
+            if (progress != null) {
+                eventData.put("progress", progress)
+            }
+            if (error != null) {
+                eventData.put("error", error)
+            }
+
+            if (doLog) Log.d(TAG, "PhotoWorkerService: Queuing loading status for $sourceId: loading=$isLoading, progress=$progress")
+
+            // Use message queue instead of direct event triggering
+            plugin?.queueMessage("photo-worker-loading-status", eventData)
+
+        } catch (error: Exception) {
+            Log.e(TAG, "PhotoWorkerService: Error creating loading status message", error)
+        }
+    }
+
+    /**
+     * Get active process count for monitoring
+     */
+    fun getActiveProcessCount(): Int = processTable.size
+
+    /**
+     * Get process status for debugging
+     */
+    fun getProcessStatus(): Map<ProcessId, String> {
+        return processTable.mapValues { (_, info) ->
+            "${info.type}:${info.priority}:${System.currentTimeMillis() - info.startTime}ms"
+        }
+    }
+
+    /**
+     * Clean up all resources
+     */
+    fun cleanup() {
+        if (doLog) Log.d(TAG, "PhotoWorkerService: Cleaning up all resources")
+
+        // Abort all active processes
+        processTable.keys.forEach { processId ->
+            abortProcess(processId)
+        }
+
+        // Cancel service scope
+        serviceScope.cancel()
+
+        // Clean up photo operations
+        photoOperations.cleanup()
+    }
+
+    /**
+     * Set max photos in area for photo operations
+     */
+    fun setMaxPhotosInArea(maxPhotos: Int) {
+        photoOperations.setMaxPhotosInArea(maxPhotos)
+    }
+
+    /**
+     * Manually serialize PhotoData list to JSON to avoid serialization compiler plugin issues
+     */
+    private fun serializePhotoDataList(photos: List<PhotoData>): String {
+        if (photos.isEmpty()) return "[]"
+
+        val jsonArray = photos.joinToString(separator = ",", prefix = "[", postfix = "]") { photo ->
+            val creatorJson = serializeCreator(photo.creator)
+            val sizesJson = if (photo.sizes != null) serializeSizes(photo.sizes!!) else "null"
+            val fileJson = if (photo.filename != null) "\"${photo.filename}\"" else "null"
+            val urlJson = if (photo.url != null) "\"${photo.url}\"" else "null"
+            val fileHashJson = if (photo.fileHash != null) "\"${photo.fileHash}\"" else "null"
+            val descriptionJson = if (photo.description != null) "\"${photo.description.replace("\\", "\\\\").replace("\"", "\\\"")}\"" else "null"
+            val licenseJson = if (photo.license != null) "\"${photo.license}\"" else "null"
+            """
+            {
+                "id": "${photo.id}",
+                "uid": "${photo.uid}",
+                "source_type": "${photo.source_type}",
+                "filename": $fileJson,
+                "description": $descriptionJson,
+                "url": $urlJson,
+                "coord": {
+                    "lat": ${photo.coord.lat},
+                    "lng": ${photo.coord.lng}
+                },
+                "bearing": ${photo.bearing},
+                "altitude": ${photo.altitude ?: "null"},
+                "source": "${photo.source}",
+                "sizes": $sizesJson,
+                "is_device_photo": ${photo.is_device_photo},
+                "captured_at": ${photo.captured_at ?: "null"},
+                "created_at": ${photo.created_at ?: "null"},
+                "accuracy": ${photo.accuracy ?: "null"},
+                "fileHash": $fileHashJson,
+                "range_distance": ${photo.range_distance ?: "null"},
+                "is_pano": ${photo.is_pano ?: "null"},
+                "creator": $creatorJson,
+                "featured": ${photo.featured ?: "null"},
+                "filtered": ${photo.filtered ?: "null"},
+                "license": $licenseJson
+            }
+            """.trimIndent()
+        }
+
+        return jsonArray
+    }
+
+    private fun serializeSizes(sizes: Map<String, PhotoSize>): String {
+        val sizesJson = sizes.entries.joinToString(", ") { (key, size) ->
+            val pyramidJson = if (size.pyramid != null) size.pyramid.toString() else "null"
+            """
+            "$key": {
+                "url": "${size.url}",
+                "width": ${size.width},
+                "height": ${size.height},
+                "pyramid": $pyramidJson
+            }
+            """.trimIndent()
+        }
+        return "{ $sizesJson }"
+    }
+
+    private fun serializeCreator(creator: Creator?): String {
+        return if (creator != null) {
+            """{"id": "${creator.id}", "username": "${creator.username}"}"""
+        } else {
+            "null"
+        }
+    }
+}
+
+/**
+ * Area processing data structure
+ */
+@kotlinx.serialization.Serializable
+private data class AreaData(
+    val sources: List<SourceConfig>,
+    val bounds: Bounds,
+    val maxPhotos: Int,
+    val range: Double,
+    val picks: List<String> = emptyList(),
+    val queryOptionsJson: String? = null,  // Pre-serialized analysis filters
+    val generation: Int? = null  // Frontend generation counter for staleness detection
+)

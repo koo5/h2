@@ -1,0 +1,702 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "PermissionFile",
+  "description": "Permission file that can define a default permission, a set of permissions or a list of inlined permissions.",
+  "type": "object",
+  "properties": {
+    "default": {
+      "description": "The default permission set for the plugin",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/DefaultPermission"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "set": {
+      "description": "A list of permissions sets defined",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/PermissionSet"
+      }
+    },
+    "permission": {
+      "description": "A list of inlined permissions",
+      "default": [],
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/Permission"
+      }
+    }
+  },
+  "definitions": {
+    "DefaultPermission": {
+      "description": "The default permission set of the plugin.\n\nWorks similarly to a permission with the \"default\" identifier.",
+      "type": "object",
+      "required": [
+        "permissions"
+      ],
+      "properties": {
+        "version": {
+          "description": "The version of the permission.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 1.0
+        },
+        "description": {
+          "description": "Human-readable description of what the permission does. Tauri convention is to use `<h4>` headings in markdown content for Tauri documentation generation purposes.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "permissions": {
+          "description": "All permissions this set contains.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "PermissionSet": {
+      "description": "A set of direct permissions grouped together under a new name.",
+      "type": "object",
+      "required": [
+        "description",
+        "identifier",
+        "permissions"
+      ],
+      "properties": {
+        "identifier": {
+          "description": "A unique identifier for the permission.",
+          "type": "string"
+        },
+        "description": {
+          "description": "Human-readable description of what the permission does.",
+          "type": "string"
+        },
+        "permissions": {
+          "description": "All permissions this set contains.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/PermissionKind"
+          }
+        }
+      }
+    },
+    "Permission": {
+      "description": "Descriptions of explicit privileges of commands.\n\nIt can enable commands to be accessible in the frontend of the application.\n\nIf the scope is defined it can be used to fine grain control the access of individual or multiple commands.",
+      "type": "object",
+      "required": [
+        "identifier"
+      ],
+      "properties": {
+        "version": {
+          "description": "The version of the permission.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 1.0
+        },
+        "identifier": {
+          "description": "A unique identifier for the permission.",
+          "type": "string"
+        },
+        "description": {
+          "description": "Human-readable description of what the permission does. Tauri internal convention is to use `<h4>` headings in markdown content for Tauri documentation generation purposes.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "commands": {
+          "description": "Allowed or denied commands when using this permission.",
+          "default": {
+            "allow": [],
+            "deny": []
+          },
+          "allOf": [
+            {
+              "$ref": "#/definitions/Commands"
+            }
+          ]
+        },
+        "scope": {
+          "description": "Allowed or denied scoped when using this permission.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Scopes"
+            }
+          ]
+        },
+        "platforms": {
+          "description": "Target platforms this permission applies. By default all platforms are affected by this permission.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/definitions/Target"
+          }
+        }
+      }
+    },
+    "Commands": {
+      "description": "Allowed and denied commands inside a permission.\n\nIf two commands clash inside of `allow` and `deny`, it should be denied by default.",
+      "type": "object",
+      "properties": {
+        "allow": {
+          "description": "Allowed command.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "deny": {
+          "description": "Denied command, which takes priority.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "Scopes": {
+      "description": "An argument for fine grained behavior control of Tauri commands.\n\nIt can be of any serde serializable type and is used to allow or prevent certain actions inside a Tauri command. The configured scope is passed to the command and will be enforced by the command implementation.\n\n## Example\n\n```json { \"allow\": [{ \"path\": \"$HOME/**\" }], \"deny\": [{ \"path\": \"$HOME/secret.txt\" }] } ```",
+      "type": "object",
+      "properties": {
+        "allow": {
+          "description": "Data that defines what is allowed by the scope.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/definitions/Value"
+          }
+        },
+        "deny": {
+          "description": "Data that defines what is denied by the scope. This should be prioritized by validation logic.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/definitions/Value"
+          }
+        }
+      }
+    },
+    "Value": {
+      "description": "All supported ACL values.",
+      "anyOf": [
+        {
+          "description": "Represents a null JSON value.",
+          "type": "null"
+        },
+        {
+          "description": "Represents a [`bool`].",
+          "type": "boolean"
+        },
+        {
+          "description": "Represents a valid ACL [`Number`].",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Number"
+            }
+          ]
+        },
+        {
+          "description": "Represents a [`String`].",
+          "type": "string"
+        },
+        {
+          "description": "Represents a list of other [`Value`]s.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Value"
+          }
+        },
+        {
+          "description": "Represents a map of [`String`] keys to [`Value`]s.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/definitions/Value"
+          }
+        }
+      ]
+    },
+    "Number": {
+      "description": "A valid ACL number.",
+      "anyOf": [
+        {
+          "description": "Represents an [`i64`].",
+          "type": "integer",
+          "format": "int64"
+        },
+        {
+          "description": "Represents a [`f64`].",
+          "type": "number",
+          "format": "double"
+        }
+      ]
+    },
+    "Target": {
+      "description": "Platform target.",
+      "oneOf": [
+        {
+          "description": "MacOS.",
+          "type": "string",
+          "enum": [
+            "macOS"
+          ]
+        },
+        {
+          "description": "Windows.",
+          "type": "string",
+          "enum": [
+            "windows"
+          ]
+        },
+        {
+          "description": "Linux.",
+          "type": "string",
+          "enum": [
+            "linux"
+          ]
+        },
+        {
+          "description": "Android.",
+          "type": "string",
+          "enum": [
+            "android"
+          ]
+        },
+        {
+          "description": "iOS.",
+          "type": "string",
+          "enum": [
+            "iOS"
+          ]
+        }
+      ]
+    },
+    "PermissionKind": {
+      "type": "string",
+      "oneOf": [
+        {
+          "description": "Enables the check_camera_permission command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-check-camera-permission",
+          "markdownDescription": "Enables the check_camera_permission command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the check_camera_permission command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-check-camera-permission",
+          "markdownDescription": "Denies the check_camera_permission command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the check_tauri_permissions command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-check-tauri-permissions",
+          "markdownDescription": "Enables the check_tauri_permissions command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the check_tauri_permissions command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-check-tauri-permissions",
+          "markdownDescription": "Denies the check_tauri_permissions command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the clear_auth_token command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-clear-auth-token",
+          "markdownDescription": "Enables the clear_auth_token command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the clear_auth_token command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-clear-auth-token",
+          "markdownDescription": "Denies the clear_auth_token command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the cmd command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-cmd",
+          "markdownDescription": "Enables the cmd command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the cmd command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-cmd",
+          "markdownDescription": "Denies the cmd command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_auth_token command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-auth-token",
+          "markdownDescription": "Enables the get_auth_token command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_auth_token command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-auth-token",
+          "markdownDescription": "Denies the get_auth_token command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_intent_data command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-intent-data",
+          "markdownDescription": "Enables the get_intent_data command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_intent_data command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-intent-data",
+          "markdownDescription": "Denies the get_intent_data command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_notification_settings command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-notification-settings",
+          "markdownDescription": "Enables the get_notification_settings command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_notification_settings command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-notification-settings",
+          "markdownDescription": "Denies the get_notification_settings command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_push_distributors command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-push-distributors",
+          "markdownDescription": "Enables the get_push_distributors command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_push_distributors command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-push-distributors",
+          "markdownDescription": "Denies the get_push_distributors command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_push_registration_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-push-registration-status",
+          "markdownDescription": "Enables the get_push_registration_status command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_push_registration_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-push-registration-status",
+          "markdownDescription": "Denies the get_push_registration_status command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the getSensorAccuracy command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-sensor-accuracy",
+          "markdownDescription": "Enables the getSensorAccuracy command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the getSensorAccuracy command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-sensor-accuracy",
+          "markdownDescription": "Denies the getSensorAccuracy command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the import_photos command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-import-photos",
+          "markdownDescription": "Enables the import_photos command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the import_photos command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-import-photos",
+          "markdownDescription": "Denies the import_photos command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the is_token_expired command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-is-token-expired",
+          "markdownDescription": "Enables the is_token_expired command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the is_token_expired command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-is-token-expired",
+          "markdownDescription": "Denies the is_token_expired command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the photo_worker_process command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-photo-worker-process",
+          "markdownDescription": "Enables the photo_worker_process command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the photo_worker_process command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-photo-worker-process",
+          "markdownDescription": "Denies the photo_worker_process command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the poll_messages command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-poll-messages",
+          "markdownDescription": "Enables the poll_messages command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the poll_messages command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-poll-messages",
+          "markdownDescription": "Denies the poll_messages command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the refresh_auth_token command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-refresh-auth-token",
+          "markdownDescription": "Enables the refresh_auth_token command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the refresh_auth_token command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-refresh-auth-token",
+          "markdownDescription": "Denies the refresh_auth_token command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the refresh_photo_scan command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-refresh-photo-scan",
+          "markdownDescription": "Enables the refresh_photo_scan command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the refresh_photo_scan command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-refresh-photo-scan",
+          "markdownDescription": "Denies the refresh_photo_scan command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the register_listener command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-register-listener",
+          "markdownDescription": "Enables the register_listener command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the register_listener command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-register-listener",
+          "markdownDescription": "Denies the register_listener command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the remove_listener command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-remove-listener",
+          "markdownDescription": "Enables the remove_listener command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the remove_listener command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-remove-listener",
+          "markdownDescription": "Denies the remove_listener command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the request_camera_permission command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-request-camera-permission",
+          "markdownDescription": "Enables the request_camera_permission command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the request_camera_permission command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-request-camera-permission",
+          "markdownDescription": "Denies the request_camera_permission command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the request_post_notification_permission command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-request-post-notification-permission",
+          "markdownDescription": "Enables the request_post_notification_permission command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the request_post_notification_permission command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-request-post-notification-permission",
+          "markdownDescription": "Denies the request_post_notification_permission command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the request_tauri_permission command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-request-tauri-permission",
+          "markdownDescription": "Enables the request_tauri_permission command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the request_tauri_permission command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-request-tauri-permission",
+          "markdownDescription": "Denies the request_tauri_permission command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the retry_failed_uploads command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-retry-failed-uploads",
+          "markdownDescription": "Enables the retry_failed_uploads command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the retry_failed_uploads command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-retry-failed-uploads",
+          "markdownDescription": "Denies the retry_failed_uploads command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the select_push_distributor command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-select-push-distributor",
+          "markdownDescription": "Enables the select_push_distributor command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the select_push_distributor command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-select-push-distributor",
+          "markdownDescription": "Denies the select_push_distributor command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the set_notification_settings command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-set-notification-settings",
+          "markdownDescription": "Enables the set_notification_settings command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the set_notification_settings command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-set-notification-settings",
+          "markdownDescription": "Denies the set_notification_settings command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the set_upload_config command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-set-upload-config",
+          "markdownDescription": "Enables the set_upload_config command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the set_upload_config command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-set-upload-config",
+          "markdownDescription": "Denies the set_upload_config command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the share_photo command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-share-photo",
+          "markdownDescription": "Enables the share_photo command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the share_photo command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-share-photo",
+          "markdownDescription": "Denies the share_photo command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the start_precise_location_listener command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-start-precise-location-listener",
+          "markdownDescription": "Enables the start_precise_location_listener command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the start_precise_location_listener command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-start-precise-location-listener",
+          "markdownDescription": "Denies the start_precise_location_listener command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the start_sensor command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-start-sensor",
+          "markdownDescription": "Enables the start_sensor command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the start_sensor command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-start-sensor",
+          "markdownDescription": "Denies the start_sensor command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the stop_precise_location_listener command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-stop-precise-location-listener",
+          "markdownDescription": "Enables the stop_precise_location_listener command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the stop_precise_location_listener command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-stop-precise-location-listener",
+          "markdownDescription": "Denies the stop_precise_location_listener command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the stop_sensor command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-stop-sensor",
+          "markdownDescription": "Enables the stop_sensor command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the stop_sensor command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-stop-sensor",
+          "markdownDescription": "Denies the stop_sensor command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the store_auth_token command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-store-auth-token",
+          "markdownDescription": "Enables the store_auth_token command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the store_auth_token command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-store-auth-token",
+          "markdownDescription": "Denies the store_auth_token command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the test_auth_expired_notification command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-test-auth-expired-notification",
+          "markdownDescription": "Enables the test_auth_expired_notification command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the test_auth_expired_notification command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-test-auth-expired-notification",
+          "markdownDescription": "Denies the test_auth_expired_notification command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the test_show_notification command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-test-show-notification",
+          "markdownDescription": "Enables the test_show_notification command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the test_show_notification command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-test-show-notification",
+          "markdownDescription": "Denies the test_show_notification command without any pre-configured scope."
+        },
+        {
+          "description": "Default permissions for the plugin\n#### This default permission set includes:\n\n- `allow-start-sensor`\n- `allow-stop-sensor`\n- `allow-register-listener`\n- `allow-remove-listener`\n- `allow-start-precise-location-listener`\n- `allow-stop-precise-location-listener`\n- `allow-retry-failed-uploads`\n- `allow-store-auth-token`\n- `allow-get-auth-token`\n- `allow-clear-auth-token`\n- `allow-refresh-auth-token`\n- `allow-is-token-expired`\n- `allow-check-camera-permission`\n- `allow-request-camera-permission`\n- `allow-get-notification-settings`\n- `allow-set-notification-settings`\n- `allow-check-tauri-permissions`\n- `allow-request-tauri-permission`\n- `allow-test-show-notification`\n- `allow-refresh-photo-scan`\n- `allow-import-photos`\n- `allow-share-photo`\n- `allow-photo-worker-process`\n- `allow-get-push-distributors`\n- `allow-get-push-registration-status`\n- `allow-select-push-distributor`\n- `allow-get-intent-data`\n- `allow-poll-messages`\n- `allow-cmd`",
+          "type": "string",
+          "const": "default",
+          "markdownDescription": "Default permissions for the plugin\n#### This default permission set includes:\n\n- `allow-start-sensor`\n- `allow-stop-sensor`\n- `allow-register-listener`\n- `allow-remove-listener`\n- `allow-start-precise-location-listener`\n- `allow-stop-precise-location-listener`\n- `allow-retry-failed-uploads`\n- `allow-store-auth-token`\n- `allow-get-auth-token`\n- `allow-clear-auth-token`\n- `allow-refresh-auth-token`\n- `allow-is-token-expired`\n- `allow-check-camera-permission`\n- `allow-request-camera-permission`\n- `allow-get-notification-settings`\n- `allow-set-notification-settings`\n- `allow-check-tauri-permissions`\n- `allow-request-tauri-permission`\n- `allow-test-show-notification`\n- `allow-refresh-photo-scan`\n- `allow-import-photos`\n- `allow-share-photo`\n- `allow-photo-worker-process`\n- `allow-get-push-distributors`\n- `allow-get-push-registration-status`\n- `allow-select-push-distributor`\n- `allow-get-intent-data`\n- `allow-poll-messages`\n- `allow-cmd`"
+        }
+      ]
+    }
+  }
+}

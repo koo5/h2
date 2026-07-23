@@ -1,0 +1,294 @@
+#!/usr/bin/env python3
+"""
+Tests for photo hiding endpoints.
+
+Covers:
+- POST /api/hidden/photos (hide photo)
+- DELETE /api/hidden/photos (unhide photo)  
+- GET /api/hidden/photos (list hidden photos)
+- Authentication and authorization
+- Input validation
+- Rate limiting
+"""
+
+import requests
+import os
+import sys
+
+# Add paths for imports
+sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..'))
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+
+from utils.base_test import BaseUserManagementTest
+from utils.test_utils import clear_test_database, API_URL
+
+class TestPhotoHiding(BaseUserManagementTest):
+    """Test suite for photo hiding endpoints."""
+    
+    def setup_method(self, method=None):
+        """Set up test with photo ID."""
+        super().setup_method(method)
+        self.test_photo_id = "test_photo_123"
+        print("Setting up photo hiding tests...")
+    
+    def get_test_auth_headers(self):
+        """Get authorization headers for test user."""
+        return self.test_headers
+    
+    def test_hide_photo_success(self):
+        """Test successfully hiding a photo."""
+        print("\n--- Testing Hide Photo Success ---")
+        
+        hide_request = {
+            "photo_source": "mapillary",
+            "photo_id": self.test_photo_id,
+            "reason": "Test photo hiding"
+        }
+        
+        response = requests.post(
+            f"{API_URL}/hidden/photos",
+            json=hide_request,
+            headers=self.test_headers
+        )
+        
+        print(f"Response status: {response.status_code}")
+        print(f"Response: {response.json()}")
+        
+        assert response.status_code == 200, f"Expected 200, got {response.status_code}"
+        
+        result = response.json()
+        assert result.get("success"), f"Expected success=True, got {result}"
+        assert "hidden successfully" in result.get("message", ""), f"Expected success message, got {result}"
+        
+        print("✓ Photo hidden successfully")
+    
+    def test_hide_photo_duplicate(self):
+        """Test hiding a photo that's already hidden."""
+        print("\n--- Testing Duplicate Photo Hiding ---")
+        
+        hide_request = {
+            "photo_source": "mapillary", 
+            "photo_id": self.test_photo_id,
+            "reason": "Initial hide for duplicate test"
+        }
+        
+        # First hide the photo
+        response1 = requests.post(
+            f"{API_URL}/hidden/photos",
+            json=hide_request,
+            headers=self.test_headers
+        )
+        assert response1.status_code == 200, f"First hide failed: {response1.status_code}"
+        print("✓ Photo hidden initially")
+        
+        # Now try to hide again (should be duplicate)
+        hide_request["reason"] = "Duplicate test"
+        response2 = requests.post(
+            f"{API_URL}/hidden/photos",
+            json=hide_request,
+            headers=self.test_headers
+        )
+        
+        print(f"Duplicate response status: {response2.status_code}")
+        print(f"Duplicate response: {response2.json()}")
+        
+        assert response2.status_code == 200, f"Expected 200, got {response2.status_code}"
+        
+        result = response2.json()
+        assert result.get("success"), f"Expected success=True, got {result}"
+        assert result.get("already_hidden"), f"Expected already_hidden=True, got {result}"
+        
+        print("✓ Duplicate hiding handled correctly")
+    
+    def test_list_hidden_photos(self):
+        """Test listing hidden photos."""
+        print("\n--- Testing List Hidden Photos ---")
+        
+        response = requests.get(
+            f"{API_URL}/hidden/photos",
+            headers=self.test_headers
+        )
+        
+        print(f"Response status: {response.status_code}")
+        
+        assert response.status_code == 200, f"Expected 200, got {response.status_code}"
+        
+        photos = response.json()
+        print(f"Found {len(photos)} hidden photos")
+        
+        assert isinstance(photos, list), f"Expected list response, got {type(photos)}"
+        
+        # Verify structure if we have photos
+        if photos:
+            photo = photos[0]
+            required_fields = ["photo_source", "photo_id", "hidden_at", "reason"]
+            assert all(field in photo for field in required_fields), f"Missing required fields in {photo}"
+            print("✓ Hidden photos listed successfully")
+        else:
+            print("✓ No hidden photos found (valid response)")
+    
+    def test_unhide_photo(self):
+        """Test unhiding a photo."""
+        print("\n--- Testing Unhide Photo ---")
+        
+        # First hide the photo so we can test unhiding
+        hide_request = {
+            "photo_source": "mapillary", 
+            "photo_id": self.test_photo_id,
+            "reason": "Setup for unhide test"
+        }
+        
+        hide_response = requests.post(
+            f"{API_URL}/hidden/photos",
+            json=hide_request,
+            headers=self.test_headers
+        )
+        assert hide_response.status_code == 200, f"Setup hide failed: {hide_response.status_code}"
+        print("✓ Photo hidden for unhide test")
+        
+        # Now unhide the photo
+        unhide_request = {
+            "photo_source": "mapillary",
+            "photo_id": self.test_photo_id
+        }
+        
+        response = requests.delete(
+            f"{API_URL}/hidden/photos",
+            json=unhide_request,
+            headers=self.test_headers
+        )
+        
+        print(f"Unhide response status: {response.status_code}")
+        print(f"Unhide response: {response.json()}")
+        
+        assert response.status_code == 200, f"Expected 200, got {response.status_code}"
+        
+        result = response.json()
+        assert result.get("success"), f"Expected success=True, got {result}"
+        assert "unhidden successfully" in result.get("message", ""), f"Expected success message, got {result}"
+        
+        print("✓ Photo unhidden successfully")
+    
+    def test_authentication_required(self):
+        """Test that authentication is required."""
+        print("\n--- Testing Authentication Requirements ---")
+        
+        # Test without auth token
+        test_requests = [
+            ("POST", {"photo_source": "mapillary", "photo_id": "test"}),
+            ("DELETE", {"photo_source": "mapillary", "photo_id": "test"}),
+            ("GET", None)
+        ]
+        
+        success = True
+        for method, data in test_requests:
+            if method == "POST":
+                response = requests.post(f"{API_URL}/hidden/photos", json=data)
+            elif method == "DELETE":
+                response = requests.delete(f"{API_URL}/hidden/photos", json=data)
+            else:  # GET
+                response = requests.get(f"{API_URL}/hidden/photos")
+            
+            assert response.status_code == 401, f"{method} should require auth, got {response.status_code}"
+        
+        print("✓ All endpoints require authentication")
+    
+    def test_input_validation(self):
+        """Test input validation."""
+        print("\n--- Testing Input Validation ---")
+        
+        # Test invalid business logic (should return 400)
+        invalid_business_logic = [
+            {"photo_source": "invalid_source", "photo_id": "test"}
+        ]
+        
+        # Test missing required fields (should return 422 - Pydantic validation)
+        missing_fields = [
+            {"photo_source": "mapillary"},  # Missing photo_id
+            {"photo_id": "test"},  # Missing photo_source
+            {}  # Empty request
+        ]
+        
+        # Test business logic validation (400 expected)
+        for invalid_data in invalid_business_logic:
+            response = requests.post(
+                f"{API_URL}/hidden/photos",
+                json=invalid_data,
+                headers=self.test_headers
+            )
+            
+            assert response.status_code == 400, f"Should return 400 for invalid business logic: {invalid_data}, got {response.status_code}"
+            print(f"✓ Correctly rejected invalid business logic: {invalid_data}")
+        
+        # Test Pydantic validation (422 expected)  
+        for invalid_data in missing_fields:
+            response = requests.post(
+                f"{API_URL}/hidden/photos",
+                json=invalid_data,
+                headers=self.test_headers
+            )
+            
+            assert response.status_code == 422, f"Should return 422 for missing fields: {invalid_data}, got {response.status_code}"
+            print(f"✓ Correctly rejected missing fields: {invalid_data}")
+        
+        print("✓ Input validation working correctly")
+    
+    def run_all_tests(self):
+        """Run all photo hiding tests."""
+        print("=" * 50)
+        print("PHOTO HIDING ENDPOINT TESTS")
+        print("=" * 50)
+        
+        if not self.setup_method():
+            print("❌ Setup failed!")
+            return False
+        
+        tests = [
+            self.test_hide_photo_success,
+            self.test_hide_photo_duplicate, 
+            self.test_list_hidden_photos,
+            self.test_unhide_photo,
+            self.test_authentication_required,
+            self.test_input_validation
+        ]
+        
+        passed = 0
+        failed = 0
+        
+        for test in tests:
+            try:
+                if test():
+                    passed += 1
+                else:
+                    failed += 1
+            except Exception as e:
+                print(f"✗ {test.__name__} failed with exception: {e}")
+                failed += 1
+        
+        print("\n" + "=" * 50)
+        print(f"RESULTS: {passed} passed, {failed} failed")
+        
+        if failed == 0:
+            print("🎉 ALL PHOTO HIDING TESTS PASSED!")
+            return True
+        else:
+            print("❌ Some tests failed!")
+            return False
+
+
+def main():
+    """Run the photo hiding tests."""
+    print("🧪 Starting Photo Hiding Tests")
+    print("=" * 50)
+    
+    # Clear database first
+    clear_test_database()
+    
+    test_runner = TestPhotoHiding()
+    success = test_runner.run_all_tests()
+    return 0 if success else 1
+
+
+if __name__ == "__main__":
+    import sys
+    sys.exit(main())

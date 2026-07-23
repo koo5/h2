@@ -1,0 +1,338 @@
+#!/usr/bin/env python3
+"""
+Integration tests for the capture-time timeline endpoint.
+Tests GET /hillview/timeline (walk a user's photos by capture time).
+
+These exercise the real upload pipeline, so each test uploads photos with
+explicit, distinct captured_at values (10-minute gaps) and asserts the endpoint
+returns them keyset-ordered by (captured_at, id) around an anchor.
+"""
+
+import pytest
+import requests
+import json
+import sys
+import os
+
+sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..'))
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+
+from utils.base_test import BaseUserManagementTest
+from utils.test_utils import API_URL, upload_test_image, wait_for_photo_processing
+from utils.image_utils import create_test_image_full_gps
+from utils.secure_upload_utils import generate_test_captured_at, SecureUploadClient
+
+
+class TestPhotoTimeline(BaseUserManagementTest):
+	"""Tests for the GET /hillview/timeline endpoint."""
+
+	def _user_id(self, headers) -> str:
+		"""Resolve a user's id from their auth headers."""
+		r = requests.get(f"{API_URL}/user/profile", headers=headers)
+		assert r.status_code == 200, f"profile lookup failed: {r.status_code} - {r.text}"
+		return r.json()["id"]
+
+	async def _upload(self, token: str, i: int, minutes_ago: int, is_public: bool = True) -> str:
+		"""Upload one processed photo with a controlled capture time.
+
+		`minutes_ago` sets captured_at (larger = older). `i` varies the image
+		content/coords so each upload has a distinct MD5 (avoids dedup).
+		"""
+		image_data = create_test_image_full_gps(
+			width=200, height=150,
+			color=(40 + i * 30, 90, 150),
+			lat=50.0755, lon=14.4378 + i * 0.001,
+			bearing=(20 + i * 15) % 360
+		)
+		photo_id = await upload_test_image(
+			f"tl_{i}.jpg", image_data, f"timeline test {i}", token,
+			is_public=is_public,
+			captured_at=generate_test_captured_at(minutes_ago=minutes_ago)
+		)
+		photo_data = wait_for_photo_processing(photo_id, token, timeout=30)
+		assert photo_data["processing_status"] == "completed", \
+			f"photo {photo_id} did not process: {photo_data.get('error')}"
+		return photo_id
+
+	async def _upload_at(self, token: str, i: int, captured_at: str, filename: str,
+						 is_public: bool = True) -> str:
+		"""Upload a processed photo with an explicit captured_at + original filename,
+		so the equal-timestamp tie-break (sort by filename) can be exercised. Pass
+		the SAME captured_at string to several calls to make them genuinely tie. `i`
+		varies content so each upload has a distinct MD5 (avoids dedup)."""
+		image_data = create_test_image_full_gps(
+			width=200, height=150,
+			color=(40 + (i % 7) * 30, 90, 150),
+			lat=50.0755, lon=14.4378 + i * 0.001,
+			bearing=(20 + i * 15) % 360
+		)
+		photo_id = await upload_test_image(
+			filename, image_data, f"timeline tie {i}", token,
+			is_public=is_public,
+			captured_at=captured_at
+		)
+		photo_data = wait_for_photo_processing(photo_id, token, timeout=30)
+		assert photo_data["processing_status"] == "completed", \
+			f"photo {photo_id} did not process: {photo_data.get('error')}"
+		return photo_id
+
+	async def _upload_no_capture_time(self, token: str, i: int) -> str:
+		"""Upload a processed photo with NO capture time: omit captured_at at
+		authorize; the generated image carries no EXIF datetime, so it stays null
+		and effective_at falls back to upload time."""
+		image_data = create_test_image_full_gps(
+			width=200, height=150,
+			color=(200, 80 + i, 60),
+			lat=50.0755, lon=14.4378 + i * 0.001,
+			bearing=(20 + i * 15) % 360
+		)
+		client = SecureUploadClient(api_url=API_URL)
+		keys = client.generate_client_keys()
+		await client.register_client_key(token, keys)
+		auth = await client.authorize_upload_with_params(
+			token, f"tl_nc_{i}.jpg", len(image_data),
+			50.0755, 14.4378 + i * 0.001, "no capture time", True,
+			file_data=image_data  # note: no captured_at passed
+		)
+		await client.upload_to_worker(image_data, auth, keys, f"tl_nc_{i}.jpg")
+		photo_id = auth["photo_id"]
+		photo_data = wait_for_photo_processing(photo_id, token, timeout=30)
+		assert photo_data["processing_status"] == "completed", \
+			f"photo {photo_id} did not process: {photo_data.get('error')}"
+		return photo_id
+
+	def _set_analysis(self, photo_id: str, analysis: dict):
+		"""Tag a photo with analysis data via the internal (loopback-only) endpoint,
+		so analysis-filter behaviour can be exercised without the real analysis worker."""
+		r = requests.post(f"{API_URL}/hillview/internal/set-analysis",
+			json={"photo_id": photo_id, "analysis": analysis})
+		assert r.status_code == 200, f"set-analysis failed: {r.status_code} - {r.text}"
+
+	@pytest.mark.asyncio
+	async def test_timeline_orders_by_capture_time(self):
+		"""Returns all photos ascending by capture time, anchor in the middle."""
+		test_id = self._user_id(self.test_headers)
+		# Oldest first -> ids[] is already in ascending capture-time order.
+		ids = [await self._upload(self.test_token, i, mins)
+			   for i, mins in enumerate([50, 40, 30, 20, 10])]
+		anchor = ids[2]
+
+		r = requests.get(f"{API_URL}/hillview/timeline", params={
+			"user_ids": test_id, "anchor_id": anchor, "before": 10, "after": 10
+		}, headers=self.test_headers)
+		assert r.status_code == 200, f"{r.status_code} - {r.text}"
+		data = r.json()
+
+		assert {"photos", "anchor_index", "has_more_before", "has_more_after"} <= set(data)
+		returned = [p["id"] for p in data["photos"]]
+		assert returned == ids, f"expected ascending {ids}, got {returned}"
+		assert data["photos"][data["anchor_index"]]["id"] == anchor
+		assert data["has_more_before"] is False
+		assert data["has_more_after"] is False
+
+		# Lightweight index shape (id/coords/bearing/captured_at/owner), not a full feed.
+		p = data["photos"][0]
+		assert "lat" in p and "lng" in p
+		assert "bearing" in p and "captured_at" in p
+		assert "uploaded_at" in p and "owner_id" in p
+
+	@pytest.mark.asyncio
+	async def test_timeline_breaks_capture_time_ties_by_filename(self):
+		"""Photos sharing one captured_at (EXIF is 1-second precise, so burst shots
+		tie) are ordered by original filename, not by random uuid/insert order."""
+		test_id = self._user_id(self.test_headers)
+		# One shared capture instant → all three tie on effective_at.
+		tie_ts = generate_test_captured_at(minutes_ago=30)
+		# Insert order (b, c, a) deliberately differs from filename order (a < b < c),
+		# so a fall-through to id/insert order would mis-sort the group.
+		pid_b = await self._upload_at(self.test_token, 10, tie_ts, "burst_b.jpg")
+		pid_c = await self._upload_at(self.test_token, 11, tie_ts, "burst_c.jpg")
+		pid_a = await self._upload_at(self.test_token, 12, tie_ts, "burst_a.jpg")
+		# Distinct older/newer photos bracket the tie group in the window.
+		older = await self._upload(self.test_token, 0, 40)
+		newer = await self._upload(self.test_token, 1, 20)
+
+		r = requests.get(f"{API_URL}/hillview/timeline", params={
+			"user_ids": test_id, "anchor_id": pid_a, "before": 10, "after": 10
+		}, headers=self.test_headers)
+		assert r.status_code == 200, f"{r.status_code} - {r.text}"
+		data = r.json()
+
+		ids = [p["id"] for p in data["photos"]]
+		assert ids == [older, pid_a, pid_b, pid_c, newer], \
+			f"tie group should be filename-ordered (a,b,c), got {ids}"
+		# Anchor is the first of the tie group; the others ride along as "newer".
+		assert data["photos"][data["anchor_index"]]["id"] == pid_a
+
+	@pytest.mark.asyncio
+	async def test_timeline_before_after_window_and_has_more(self):
+		"""before/after bound the window; has_more flags report photos beyond it."""
+		test_id = self._user_id(self.test_headers)
+		ids = [await self._upload(self.test_token, i, mins)
+			   for i, mins in enumerate([50, 40, 30, 20, 10])]
+		anchor = ids[2]
+
+		r = requests.get(f"{API_URL}/hillview/timeline", params={
+			"user_ids": test_id, "anchor_id": anchor, "before": 1, "after": 1
+		}, headers=self.test_headers)
+		assert r.status_code == 200, f"{r.status_code} - {r.text}"
+		data = r.json()
+
+		returned = [p["id"] for p in data["photos"]]
+		assert returned == [ids[1], ids[2], ids[3]], f"got {returned}"
+		assert data["anchor_index"] == 1
+		assert data["photos"][1]["id"] == anchor
+		assert data["has_more_before"] is True
+		assert data["has_more_after"] is True
+
+	@pytest.mark.asyncio
+	async def test_timeline_scopes_to_requested_owner(self):
+		"""A single-owner timeline excludes other users' photos."""
+		test_id = self._user_id(self.test_headers)
+		t0 = await self._upload(self.test_token, 0, 40)
+		a1 = await self._upload(self.admin_token, 1, 30)  # admin photo, time-between
+		t2 = await self._upload(self.test_token, 2, 20)
+
+		r = requests.get(f"{API_URL}/hillview/timeline", params={
+			"user_ids": test_id, "anchor_id": t0, "before": 10, "after": 10
+		}, headers=self.test_headers)
+		assert r.status_code == 200, f"{r.status_code} - {r.text}"
+		ids = [p["id"] for p in r.json()["photos"]]
+		assert t0 in ids and t2 in ids
+		assert a1 not in ids, "another user's photo leaked into a single-owner timeline"
+
+	@pytest.mark.asyncio
+	async def test_timeline_merges_multiple_owners(self):
+		"""Multiple owner ids merge into one timeline, still time-ordered."""
+		test_id = self._user_id(self.test_headers)
+		admin_id = self._user_id(self.admin_headers)
+		t0 = await self._upload(self.test_token, 0, 40)
+		a1 = await self._upload(self.admin_token, 1, 30)
+		t2 = await self._upload(self.test_token, 2, 20)
+		a3 = await self._upload(self.admin_token, 3, 10)
+
+		r = requests.get(f"{API_URL}/hillview/timeline", params={
+			"user_ids": f"{test_id},{admin_id}", "anchor_id": t0, "before": 10, "after": 10
+		}, headers=self.test_headers)
+		assert r.status_code == 200, f"{r.status_code} - {r.text}"
+		ids = [p["id"] for p in r.json()["photos"]]
+		assert ids == [t0, a1, t2, a3], f"merged timeline mis-ordered: {ids}"
+
+	@pytest.mark.asyncio
+	async def test_timeline_private_photo_visibility(self):
+		"""Owner sees their own private photo; anonymous callers do not."""
+		test_id = self._user_id(self.test_headers)
+		t0 = await self._upload(self.test_token, 0, 40, is_public=True)
+		tp = await self._upload(self.test_token, 1, 30, is_public=False)  # private, owned by test
+		t2 = await self._upload(self.test_token, 2, 20, is_public=True)
+		params = {"user_ids": test_id, "anchor_id": t0, "before": 10, "after": 10}
+
+		r_owner = requests.get(f"{API_URL}/hillview/timeline", params=params, headers=self.test_headers)
+		assert r_owner.status_code == 200, f"{r_owner.status_code} - {r_owner.text}"
+		owner_ids = [p["id"] for p in r_owner.json()["photos"]]
+		assert tp in owner_ids, "owner should see their own private photo on the timeline"
+
+		r_anon = requests.get(f"{API_URL}/hillview/timeline", params=params)  # no auth
+		assert r_anon.status_code == 200, f"{r_anon.status_code} - {r_anon.text}"
+		anon_ids = [p["id"] for p in r_anon.json()["photos"]]
+		assert tp not in anon_ids, "anonymous caller must not see a private photo"
+		assert t0 in anon_ids and t2 in anon_ids, "public photos should still be visible anonymously"
+
+	@pytest.mark.asyncio
+	async def test_timeline_anchor_not_found(self):
+		"""An unknown anchor id returns 404."""
+		test_id = self._user_id(self.test_headers)
+		r = requests.get(f"{API_URL}/hillview/timeline", params={
+			"user_ids": test_id, "anchor_id": "does-not-exist", "before": 5, "after": 5
+		}, headers=self.test_headers)
+		assert r.status_code == 404, f"{r.status_code} - {r.text}"
+
+	@pytest.mark.asyncio
+	async def test_timeline_requires_user_ids(self):
+		"""Empty user_ids is a bad request."""
+		pid = await self._upload(self.test_token, 0, 10)
+		r = requests.get(f"{API_URL}/hillview/timeline", params={
+			"user_ids": "", "anchor_id": pid, "before": 5, "after": 5
+		}, headers=self.test_headers)
+		assert r.status_code == 400, f"{r.status_code} - {r.text}"
+
+	@pytest.mark.asyncio
+	async def test_timeline_falls_back_to_upload_time(self):
+		"""A photo with no capture time still appears, ordered by upload time."""
+		test_id = self._user_id(self.test_headers)
+		old1 = await self._upload(self.test_token, 0, 50)              # captured 50 min ago
+		old2 = await self._upload(self.test_token, 1, 40)              # captured 40 min ago
+		nocap = await self._upload_no_capture_time(self.test_token, 2)  # no capture time → upload time (now)
+
+		r = requests.get(f"{API_URL}/hillview/timeline", params={
+			"user_ids": test_id, "anchor_id": old1, "before": 10, "after": 10
+		}, headers=self.test_headers)
+		assert r.status_code == 200, f"{r.status_code} - {r.text}"
+		data = r.json()
+
+		ids = [p["id"] for p in data["photos"]]
+		assert nocap in ids, "no-capture-time photo should still appear (falls back to upload time)"
+		# Uploaded last, so effective_at = upload time sorts it after the captured ones.
+		assert ids.index(nocap) > ids.index(old2), "no-capture photo should sort by its recent upload time"
+		# The endpoint still exposes the real (null) capture time + the upload fallback.
+		entry = next(p for p in data["photos"] if p["id"] == nocap)
+		assert entry["captured_at"] is None
+		assert entry["uploaded_at"] is not None
+
+	@pytest.mark.asyncio
+	async def test_timeline_excludes_photos_failing_analysis_filter(self):
+		"""An analysis filter narrows the walk: photos that don't match are excluded
+		entirely (a hard exclude, unlike the map which only soft-flags them)."""
+		test_id = self._user_id(self.test_headers)
+		scenic = await self._upload(self.test_token, 0, 40)  # oldest
+		plain = await self._upload(self.test_token, 1, 30)
+		self._set_analysis(scenic, {"scenic_score": 5})
+		self._set_analysis(plain, {"scenic_score": 1})
+
+		base = {"user_ids": test_id, "anchor_id": scenic, "before": 10, "after": 10}
+
+		# Without a filter, both photos are in the walk.
+		r = requests.get(f"{API_URL}/hillview/timeline", params=base, headers=self.test_headers)
+		assert r.status_code == 200, f"{r.status_code} - {r.text}"
+		ids = [p["id"] for p in r.json()["photos"]]
+		assert scenic in ids and plain in ids, f"baseline should include both, got {ids}"
+
+		# With a scenic-score floor, the low-scoring photo drops out of the walk.
+		flt = json.dumps({"min_scenic_score": 3, "show_unanalyzed": False})
+		r = requests.get(f"{API_URL}/hillview/timeline",
+			params={**base, "analysis_filters": flt}, headers=self.test_headers)
+		assert r.status_code == 200, f"{r.status_code} - {r.text}"
+		ids = [p["id"] for p in r.json()["photos"]]
+		assert scenic in ids, "high-scenic photo should pass the filter"
+		assert plain not in ids, "low-scenic photo should be excluded from the walk"
+
+	@pytest.mark.asyncio
+	async def test_timeline_show_unanalyzed_toggle(self):
+		"""Unanalyzed photos ride along only when show_unanalyzed is set."""
+		test_id = self._user_id(self.test_headers)
+		scenic = await self._upload(self.test_token, 0, 40)
+		nocap = await self._upload(self.test_token, 1, 30)  # left unanalyzed
+		self._set_analysis(scenic, {"scenic_score": 5})
+
+		base = {"user_ids": test_id, "anchor_id": scenic, "before": 10, "after": 10}
+
+		# show_unanalyzed=True: the untagged photo is kept.
+		incl = json.dumps({"min_scenic_score": 3, "show_unanalyzed": True})
+		r = requests.get(f"{API_URL}/hillview/timeline",
+			params={**base, "analysis_filters": incl}, headers=self.test_headers)
+		assert r.status_code == 200, f"{r.status_code} - {r.text}"
+		ids = [p["id"] for p in r.json()["photos"]]
+		assert scenic in ids and nocap in ids, f"show_unanalyzed should keep the untagged photo, got {ids}"
+
+		# show_unanalyzed=False: it drops out, the tagged matching photo stays.
+		excl = json.dumps({"min_scenic_score": 3, "show_unanalyzed": False})
+		r = requests.get(f"{API_URL}/hillview/timeline",
+			params={**base, "analysis_filters": excl}, headers=self.test_headers)
+		assert r.status_code == 200, f"{r.status_code} - {r.text}"
+		ids = [p["id"] for p in r.json()["photos"]]
+		assert scenic in ids, "tagged matching photo stays"
+		assert nocap not in ids, "unanalyzed photo excluded when show_unanalyzed is false"
+
+
+if __name__ == "__main__":
+	pytest.main([__file__, "-v", "-s"])

@@ -1,0 +1,246 @@
+/**
+ * Culling Grid - Smart Photo Selection for Screen Coverage
+ *
+ * Ensures uniform visual distribution across the screen by:
+ * 1. Creating a 10x10 virtual grid over the current viewport bounds
+ * 2. Round-robin selection: For each source → For each screen cell → Take 1 photo
+ * 3. Continue until the limit is reached
+ *
+ * This prevents visual clustering and ensures good screen coverage across all
+ * visible areas, giving users a well-distributed overview of the entire viewport.
+ */
+
+import type { PhotoData, Bounds, PhotoId } from './photoWorkerTypes';
+
+const doLog = false;
+
+// Type aliases for clarity
+export type SourceId = string;
+export type CellKey = string; // Format: "row,col" e.g. "3,7"
+export type FileHash = string;
+export type PhotoIndex = number;
+export type Priority = 1 | 2 | 3 | 4; // 1 = highest priority
+
+// Source priority levels (lower number = higher priority)
+const SOURCE_PRIORITY: Record<SourceId, Priority> = {
+    'device': 1,
+    'hillview': 2,
+    'other': 3,
+    'mapillary': 4
+} as const;
+
+interface CellPhotos {
+    photos: PhotoData[];
+    hashToIndex: Map<FileHash, PhotoIndex>; // For efficient duplicate detection
+}
+
+export class CullingGrid {
+    private readonly GRID_SIZE = 10;
+    private bounds: Bounds;
+    private latRange: number;
+    private lngRange: number;
+
+    constructor(bounds: Bounds) {
+        this.bounds = bounds;
+        this.latRange = bounds.top_left.lat - bounds.bottom_right.lat;
+        this.lngRange = bounds.bottom_right.lng - bounds.top_left.lng;
+    }
+
+    /**
+     * Apply priority-based culling with hash deduplication and round-robin selection
+     * Matches Kotlin implementation: true round-robin across all cells until maxPhotos reached
+     *
+     * @param picks - Set of photo IDs that must always be included (e.g., currently selected photo)
+     */
+    cullPhotos(photosPerSource: Map<SourceId, PhotoData[]>, maxPhotos: number, picks: Set<PhotoId> = new Set()): PhotoData[] {
+        if (photosPerSource.size === 0 || maxPhotos <= 0) {
+            return [];
+        }
+
+        // First, extract picked photos - they are always included
+        // picks contains UIDs like "hillview-abc123"
+        const pickedPhotos: PhotoData[] = [];
+        const pickedUids = new Set<string>();
+
+        if (picks.size > 0) {
+            for (const photos of photosPerSource.values()) {
+                for (const photo of photos) {
+                    if (picks.has(photo.uid) && !pickedUids.has(photo.uid)) {
+                        pickedPhotos.push(photo);
+                        pickedUids.add(photo.uid);
+                    }
+                }
+            }
+        }
+
+        // Calculate remaining slots after picks
+        const remainingSlots = maxPhotos - pickedPhotos.length;
+        if (remainingSlots <= 0) {
+            // Picks already fill or exceed the limit
+            if (doLog) console.log(`CullingGrid: ${pickedPhotos.length} picked photos fill the limit of ${maxPhotos}`);
+            return pickedPhotos.slice(0, maxPhotos);
+        }
+
+        // Create grid to store photos by cell
+        const cellGrid = new Map<CellKey, CellPhotos>();
+
+        // Sort sources by priority (device first, mapillary last)
+        const sortedSourceIds = Array.from(photosPerSource.keys()).sort((a, b) => {
+            return this.getSourcePriority(a) - this.getSourcePriority(b);
+        });
+
+        // Populate grid cells with photos from each source (by priority order)
+        // Exclude already picked photos
+        for (const sourceId of sortedSourceIds) {
+            const sourcePhotos = photosPerSource.get(sourceId);
+            if (!sourcePhotos) continue;
+
+            // Device source: sort by most recent first so that when a cell is over-populated,
+            // the round-robin selection keeps the most recent photos.
+            const photos = sourceId === 'device'
+                ? [...sourcePhotos].sort((a, b) => (b.captured_at ?? 0) - (a.captured_at ?? 0))
+                : sourcePhotos;
+
+            for (const photo of photos) {
+                // Skip already picked photos
+                if (pickedUids.has(photo.uid)) continue;
+
+                const cellKey = this.getScreenGridKey(photo);
+
+                // Get or create cell
+                let cellData = cellGrid.get(cellKey);
+                if (!cellData) {
+                    cellData = { photos: [], hashToIndex: new Map() };
+                    cellGrid.set(cellKey, cellData);
+                }
+
+                // Check for duplicates using file hash
+                if (photo.file_hash && cellData.hashToIndex.has(photo.file_hash)) {
+                    continue; // Skip duplicate photo
+                }
+
+                // Add hash mapping if present
+                if (photo.file_hash) {
+                    cellData.hashToIndex.set(photo.file_hash, cellData.photos.length);
+                }
+
+                cellData.photos.push(photo);
+            }
+        }
+
+        // Round-robin selection across all cells until remainingSlots reached
+        const regularPhotos: PhotoData[] = [];
+        const cellIterators = Array.from(cellGrid.values()).map(cell => ({
+            photos: cell.photos,
+            index: 0
+        }));
+
+        let round = 0;
+        while (regularPhotos.length < remainingSlots && cellIterators.length > 0) {
+            round++;
+            const exhaustedIndices: number[] = [];
+
+            for (let i = cellIterators.length - 1; i >= 0; i--) {
+                if (regularPhotos.length >= remainingSlots) break;
+
+                const iterator = cellIterators[i];
+                if (iterator.index < iterator.photos.length) {
+                    regularPhotos.push(iterator.photos[iterator.index]);
+                    iterator.index++;
+                } else {
+                    exhaustedIndices.push(i);
+                }
+            }
+
+            // Remove exhausted iterators
+            for (const index of exhaustedIndices) {
+                cellIterators.splice(index, 1);
+            }
+        }
+
+        // Combine picked photos first, then regular photos
+        const result = [...pickedPhotos, ...regularPhotos];
+
+        if (doLog) console.log(`CullingGrid: ${pickedPhotos.length} picks + ${regularPhotos.length} culled (${photosPerSource.size} sources, ${Array.from(photosPerSource.values()).reduce((sum, photos) => sum + photos.length, 0)} total) = ${result.length} photos in ${round} rounds across ${cellGrid.size} cells`);
+
+        return result;
+    }
+
+    private getSourcePriority(sourceId: SourceId): Priority {
+        if (sourceId === 'device') return SOURCE_PRIORITY.device;
+        if (sourceId === 'hillview') return SOURCE_PRIORITY.hillview;
+        if (sourceId === 'mapillary') return SOURCE_PRIORITY.mapillary;
+        return SOURCE_PRIORITY.other;
+    }
+
+    private getScreenGridKey(photo: PhotoData): CellKey {
+        // Calculate position within viewport bounds (0-1)
+        const latPos = (this.bounds.top_left.lat - photo.coord.lat) / this.latRange;
+        const lngPos = (photo.coord.lng - this.bounds.top_left.lng) / this.lngRange;
+
+        // Convert to 0-9 screen grid cells (clamp to ensure valid range)
+        const gridLat = Math.min(this.GRID_SIZE - 1, Math.max(0, Math.floor(latPos * this.GRID_SIZE)));
+        const gridLng = Math.min(this.GRID_SIZE - 1, Math.max(0, Math.floor(lngPos * this.GRID_SIZE)));
+
+        return `${gridLat},${gridLng}`;
+    }
+
+    /**
+     * Update bounds for the screen grid (call when viewport changes)
+     */
+    /*updateBounds(newBounds: Bounds): void {
+        this.bounds = newBounds;
+        this.latRange = newBounds.top_left.lat - newBounds.bottom_right.lat;
+        this.lngRange = newBounds.bottom_right.lng - newBounds.top_left.lng;
+    }*/
+
+    /**
+     * Get statistics about screen coverage
+     */
+    getCoverageStats(photosPerSource: Map<SourceId, PhotoData[]>, culledPhotos: PhotoData[]): {
+        totalPhotos: number;
+        selectedPhotos: number;
+        sourceStats: { source_id: SourceId; original: number; selected: number; percentage: number }[];
+        screenCoverage: { cellKey: CellKey; photoCount: number }[];
+        emptyCells: number;
+        totalCells: number;
+    } {
+        const totalPhotos = Array.from(photosPerSource.values()).reduce((sum, photos) => sum + photos.length, 0);
+
+        // Count photos per source in result
+        const selectedPerSource = new Map<string, number>();
+        const selectedPerCell = new Map<string, number>();
+
+        for (const photo of culledPhotos) {
+            const sourceId = photo.source?.id || 'unknown';
+            selectedPerSource.set(sourceId, (selectedPerSource.get(sourceId) || 0) + 1);
+
+            const gridKey = this.getScreenGridKey(photo);
+            selectedPerCell.set(gridKey, (selectedPerCell.get(gridKey) || 0) + 1);
+        }
+
+        const sourceStats = Array.from(photosPerSource.entries()).map(([sourceId, photos]) => ({
+            source_id: sourceId,
+            original: photos.length,
+            selected: selectedPerSource.get(sourceId) || 0,
+            percentage: photos.length > 0 ? ((selectedPerSource.get(sourceId) || 0) / photos.length) * 100 : 0
+        }));
+
+        const screenCoverage = Array.from(selectedPerCell.entries()).map(([cellKey, photoCount]) => ({
+            cellKey,
+            photoCount
+        }));
+
+        const totalCells = this.GRID_SIZE * this.GRID_SIZE;
+        const emptyCells = totalCells - selectedPerCell.size;
+
+        return {
+            totalPhotos,
+            selectedPhotos: culledPhotos.length,
+            sourceStats,
+            screenCoverage,
+            emptyCells,
+            totalCells
+        };
+    }
+}

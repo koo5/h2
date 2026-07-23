@@ -1,0 +1,202 @@
+import { invoke } from '@tauri-apps/api/core';
+import type { TokenManager, TokenData } from './tokenManager';
+import { TokenRefreshError } from './tokenManager';
+import { auth } from './authStore';
+import { logout, getAuthGeneration } from './auth.svelte';
+import { kotlinMessageQueue } from './KotlinMessageQueue';
+
+/**
+ * Android Token Manager
+ *
+ * Delegates all token operations to the Android plugin, which handles
+ * refresh logic with mutex protection to prevent race conditions.
+ */
+export class AndroidTokenManager implements TokenManager {
+    private readonly LOG_PREFIX = '🢄🔐[ANDROID_TOKEN_MGR]';
+
+    constructor() {
+        this.setupSessionExpiryHandler();
+    }
+
+    /**
+     * Native clears the session when the server rejects the refresh token (401) and
+     * enqueues an "auth-expired" message via the durable Kotlin→JS message queue
+     * (polled), NOT a fire-and-forget Tauri event. The queue survives the case where
+     * the 401 happens while the app is backgrounded with no WebView — the message
+     * waits and is delivered when the WebView next polls. We then log out in lockstep
+     * so the JS auth store and native token state don't diverge (otherwise the UI stays
+     * "authenticated" while native has no tokens). Re-checks current tokens first so a
+     * re-login that already replaced the session isn't torn down by a stale message
+     * from the previous one.
+     */
+    private setupSessionExpiryHandler(): void {
+        if (!kotlinMessageQueue) {
+            console.warn(`${this.LOG_PREFIX} 🔐➡️ kotlinMessageQueue unavailable; cannot register 'auth-expired' handler`);
+            return;
+        }
+        console.log(`${this.LOG_PREFIX} 🔐➡️ Registering 'auth-expired' message-queue handler`);
+        kotlinMessageQueue.on('auth-expired', async () => {
+            // Snapshot at receipt, BEFORE any await: if a re-login bumps the auth
+            // generation while we re-check the token, the stale-tagged logout below is
+            // suppressed by logout()'s guard — the same deterministic protection the web
+            // path uses, closing the TOCTOU the getValidToken() re-check alone can't.
+            const generation = getAuthGeneration();
+            console.warn(`${this.LOG_PREFIX} 🔐➡️ Received 'auth-expired' from native message queue (gen ${generation})`);
+            try {
+                // Re-check: if a re-login already replaced the session, native now has a
+                // valid token — don't tear it down over the old 401.
+                const token = await this.getValidToken();
+                if (token) {
+                    console.log(`${this.LOG_PREFIX} 🔐➡️ Native has a valid token again (re-login?); ignoring stale auth-expired`);
+                    return;
+                }
+                console.warn(`${this.LOG_PREFIX} 🔐➡️ No valid token; logging out JS in lockstep with native`);
+                logout('Session expired (native)', { generation });
+            } catch (error) {
+                console.error(`${this.LOG_PREFIX} 🔐➡️ Error handling 'auth-expired':`, error);
+            }
+        });
+        console.log(`${this.LOG_PREFIX} 🔐➡️ 'auth-expired' message-queue handler registered`);
+    }
+
+    async getValidToken(force: boolean = false): Promise<string | null> {
+        // console.log(`${this.LOG_PREFIX} Getting valid token from Android (force: ${force})`);
+
+        try {
+            // Android plugin handles token validation and refresh internally
+            const result = await invoke('plugin:hillview|get_auth_token', { force }) as {
+                token: string | null;
+                expires_at: string | null;
+                success: boolean;
+                error?: string;
+            };
+
+            if (!result.success) {
+                console.log(`${this.LOG_PREFIX} Android reports no valid token: ${result.error}`);
+                return null;
+            }
+
+            if (result.token) {
+                // console.log(`${this.LOG_PREFIX} Valid token received from Android`);
+                return result.token;
+            }
+
+            console.log(`${this.LOG_PREFIX} No token available`);
+            return null;
+        } catch (err) {
+            console.error(`${this.LOG_PREFIX} Failed to get valid token:`, err);
+            return null;
+        }
+    }
+
+    async refreshToken(): Promise<boolean> {
+        try {
+            // console.log(`${this.LOG_PREFIX} Requesting token refresh from Android`);
+
+            const result = await invoke('plugin:hillview|refresh_auth_token') as {
+                success: boolean;
+                error?: string;
+            };
+
+            if (result.success) {
+                // console.log(`${this.LOG_PREFIX} Token refresh successful`);
+                return true;
+            } else {
+                console.log(`${this.LOG_PREFIX} Token refresh failed: ${result.error}`);
+                return false;
+            }
+
+        } catch (error) {
+            console.error(`${this.LOG_PREFIX} Error refreshing token:`, error);
+            throw new TokenRefreshError(`Android token refresh failed: ${error}`);
+        }
+    }
+
+    async storeTokens(tokenData: TokenData): Promise<void> {
+        try {
+            // console.log(`${this.LOG_PREFIX} Storing tokens in Android`);
+            // console.log(`${this.LOG_PREFIX} - Token data:`, JSON.stringify({
+            //     hasAccessToken: !!tokenData.access_token,
+            //     hasRefreshToken: !!tokenData.refresh_token,
+            //     expiresAt: tokenData.expires_at,
+            //     refreshTokenExpiresAt: tokenData.refresh_token_expires_at
+            // }));
+
+            // console.log(`${this.LOG_PREFIX} - Calling plugin with:`, JSON.stringify({
+            //     token: tokenData.access_token ? 'present' : 'missing',
+            //     refreshToken: tokenData.refresh_token ? 'present' : 'missing',
+            //     expiresAt: tokenData.expires_at,
+            //     refreshExpiry: tokenData.refresh_token_expires_at
+            // }));
+
+            const result = await invoke('plugin:hillview|store_auth_token', {
+                token: tokenData.access_token,
+                refresh_token: tokenData.refresh_token,
+                // Forwarded to native as-is: it must stay a Z-terminated ISO-8601 instant.
+                // The Kotlin side parses it with Java ISO_INSTANT, which rejects a "+00:00"
+                // offset. Backend token responses (response_model=Token) already emit the
+                // Z form — don't reformat it here.
+                expires_at: tokenData.expires_at,
+                refresh_expiry: tokenData.refresh_token_expires_at
+            }) as { success: boolean; error?: string };
+
+            if (!result.success) {
+                const errorMsg = result.error || 'Unknown error storing tokens';
+                console.error(`${this.LOG_PREFIX} Plugin returned error: ${errorMsg}`);
+                throw new Error(`${errorMsg}`);
+            }
+
+            // console.log(`${this.LOG_PREFIX} Tokens stored successfully in Android`);
+
+            // Update auth store - tokens stored means authenticated
+            auth.update(state => ({
+                ...state,
+                is_authenticated: true
+            }));
+
+        } catch (error) {
+            console.error(`${this.LOG_PREFIX} Error storing tokens in Android:`, error);
+            throw error;
+        }
+    }
+
+    async clearTokens(): Promise<void> {
+        try {
+            // console.log(`${this.LOG_PREFIX} Clearing tokens in Android`);
+
+            await invoke('plugin:hillview|clear_auth_token');
+
+            // console.log(`${this.LOG_PREFIX} Tokens cleared successfully from Android`);
+
+            // Update auth store - no tokens means not authenticated
+            auth.update(state => ({
+                ...state,
+                is_authenticated: false,
+                user: null
+            }));
+
+        } catch (error) {
+            console.error(`${this.LOG_PREFIX} Error clearing tokens from Android:`, error);
+            throw error;
+        }
+    }
+
+    async isTokenExpired(bufferMinutes: number = 2): Promise<boolean> {
+        try {
+            const result = await invoke('plugin:hillview|is_token_expired', {
+                buffer_minutes: bufferMinutes
+            }) as { expired: boolean };
+
+            return result.expired;
+        } catch (err) {
+            console.error(`${this.LOG_PREFIX} Failed to check token expiry:`, err);
+            return true; // Assume expired on error for safety
+        }
+    }
+
+    async registerClientPublicKey(): Promise<void> {
+        // Client key registration is now handled automatically by Android during token storage
+        // console.log(`${this.LOG_PREFIX} Client public key registration handled automatically by Android`);
+    }
+
+}

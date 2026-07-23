@@ -1,0 +1,55 @@
+<script lang="ts">
+	export let data;
+
+	let Main: any;
+	if (browser && typeof window !== 'undefined') {
+		async function loadMain() {
+			console.log('Loading Main component dynamically');
+			const module = await import('$lib/components/Main.svelte');
+			Main = module.default;
+		}
+		loadMain();
+	}
+
+	import {browser} from '$app/environment';
+	import {page} from '$app/stores';
+	import {HILLVIEW_BASE_URL} from '$lib/urlUtilsServer';
+	import PhotoHead from '$lib/components/PhotoHead.svelte';
+
+	$: meta = data?.photoMeta;
+	$: photoTitle = meta
+		? meta.description
+			? `${meta.description} - Hillview`
+			: 'Photo on Hillview'
+		: null;
+</script>
+
+
+{#if meta && photoTitle}
+	<PhotoHead
+		title={photoTitle}
+		description={meta.description ?? ''}
+		ogType="article"
+		ogUrl={$page.url.href}
+		ogImage={meta.imageUrl
+			? { url: meta.imageUrl, width: meta.width, height: meta.height }
+			: null}
+		latitude={meta.latitude ?? null}
+		longitude={meta.longitude ?? null}
+		canonicalUrl={meta.photoUid
+			? `${HILLVIEW_BASE_URL}/photo/${encodeURIComponent(meta.photoUid)}`
+			: null}
+	/>
+{:else}
+	<PhotoHead
+		title="Hillview - annotated panoramas"
+		description="Photos from places where cars can't go"
+		ogType="website"
+		ogImage={{ url: `${HILLVIEW_BASE_URL}/og-card.png`, width: 1200, height: 630 }}
+		canonicalUrl={`${HILLVIEW_BASE_URL}/`}
+	/>
+{/if}
+
+{#if browser && Main}
+	<svelte:component this={Main}/>
+{/if}

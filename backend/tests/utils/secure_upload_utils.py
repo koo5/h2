@@ -1,0 +1,505 @@
+"""
+Secure Upload Workflow Utilities for Tests
+
+This module provides reusable utilities for testing the secure three-phase upload workflow:
+1. Client authentication & public key registration
+2. Upload authorization from API server
+3. Worker processing with client signature verification
+
+Use these utilities instead of calling the old /upload endpoint directly.
+"""
+
+import httpx
+import json
+import base64
+import os
+from datetime import timedelta
+import datetime
+import uuid
+from common.utc import utcnow, format_utc
+from common.jwt_utils import generate_ecdsa_key_pair, serialize_private_key, serialize_public_key
+import sys
+import pytest
+import hashlib
+import asyncio
+import random
+
+# Add backend directory to path for imports
+backend_dir = os.path.join(os.path.dirname(__file__), '..', '..')
+sys.path.append(backend_dir)
+
+from common.jwt_utils import generate_ecdsa_key_pair, serialize_private_key, serialize_public_key
+from .test_utils import recreate_test_users
+
+
+class WorkerUnavailableError(Exception):
+	"""Raised when the worker server can't be reached at its advertised URL.
+
+	This is an expected, self-explanatory failure (the message already names the
+	worker URL and underlying cause), so callers should print it plainly instead
+	of dumping a full traceback.
+	"""
+	pass
+
+
+# --- Upload backpressure handling -----------------------------------------
+# The worker accepts only MAX_PENDING_TASKS concurrent uploads and rejects the
+# rest with 503 (a client mid-upload may instead see a transport reset). For a
+# bulk uploader (the luigi upload fan-out) these are transient "server busy"
+# signals, not failures — the queue drains in seconds as in-flight uploads
+# finish — so upload_to_worker retries them with bounded, jittered exponential
+# backoff instead of surfacing queue-full as a hard upload failure. We
+# deliberately do NOT follow the server's Retry-After verbatim: it's a static
+# policy value (QUEUE_FULL_RETRY_AFTER_SECONDS, ~500s) meant for mobile clients
+# that should back off for minutes, whereas a colocated bulk uploader wants to
+# re-probe within seconds and a 503 is cheap (sent before the body is read).
+# Bounded by a total wait budget so a genuinely wedged worker still surfaces
+# instead of hanging forever; set HILLVIEW_UPLOAD_RETRY_BUDGET_S=0 to disable
+# (fail fast on the first 503).
+# Default ~8h: a long bulk run can sit behind sustained backpressure, and
+# waiting is almost always better than failing a task — this budget is only the
+# backstop for a genuinely wedged worker, not the expected wait.
+_DEFAULT_UPLOAD_RETRY_BUDGET_S = 8 * 60 * 60
+
+
+def _upload_retry_budget_s() -> float:
+	try:
+		return max(0.0, float(os.getenv(
+			"HILLVIEW_UPLOAD_RETRY_BUDGET_S", str(_DEFAULT_UPLOAD_RETRY_BUDGET_S))))
+	except (TypeError, ValueError):
+		return float(_DEFAULT_UPLOAD_RETRY_BUDGET_S)
+
+
+def _backpressure_delay(attempt: int, base: float = 0.5, cap: float = 20.0) -> float:
+	"""Full-jittered exponential backoff (seconds) before upload retry ``attempt``.
+
+	Full jitter (uniform in [0, ceiling]) decorrelates the many concurrent
+	uploaders — separate luigi processes — so they don't retry in lockstep and
+	re-saturate the worker the instant a slot frees.
+	"""
+	ceiling = min(base * (2 ** max(0, attempt - 1)), cap)
+	return random.uniform(0.0, ceiling) if ceiling > 0 else 0.0
+
+
+def generate_test_captured_at(minutes_ago: int = 10) -> str:
+	"""Generate a fake captured_at timestamp for test images.
+
+	Use this when uploading generated test images that don't have real EXIF data.
+	Real file uploads should omit captured_at and let the worker extract it from EXIF.
+	"""
+	return format_utc(utcnow() - timedelta(minutes=minutes_ago))
+
+
+class SecureUploadClient:
+	"""
+	Utility class for testing the secure upload workflow.
+
+	Handles client key generation, signature creation, and the full three-phase workflow.
+	"""
+
+	def __init__(self, api_url: str = None):
+		self.api_url = api_url or os.getenv("API_URL", "http://localhost:8055")
+		self.client_keys = None
+		self.key_id = None
+
+	async def setup_test_environment(self):
+		"""Set up test environment using shared test utility."""
+		return recreate_test_users()
+
+
+	def test_image(self):
+		"""Create a test image file with EXIF data."""
+		img = Image.new('RGB', (400, 300), color='blue')
+		temp_file = tempfile.NamedTemporaryFile(suffix='.jpg', delete=False)
+		img.save(temp_file.name, 'JPEG', quality=95)
+		temp_file.close()
+
+		yield temp_file.name
+		os.unlink(temp_file.name)
+
+	async def test_user_auth(self, setup_result):
+		"""Get authentication token for the test user."""
+		if not setup_result:
+			raise Exception("Test environment not available")
+
+		async with httpx.AsyncClient() as client:
+			response = await client.post(f"{self.api_url}/auth/token", data={
+				"username": "test",
+				"password": "StrongTestPassword123!"
+			})
+
+			if response.status_code == 200:
+				return response.json()["access_token"]
+			else:
+				raise Exception(f"Failed to get test user token: {response.status_code}")
+
+	def client_key_pair(self):
+		"""Generate a real ECDSA key pair for testing client operations."""
+		sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+
+		private_key, public_key = generate_ecdsa_key_pair()
+		return {
+			"private_key": private_key,
+			"public_key": public_key,
+			"private_pem": serialize_private_key(private_key),
+			"public_pem": serialize_public_key(public_key)
+		}
+
+	def generate_client_signature(self, client_private_key, photo_id: str, filename: str, timestamp: int) -> str:
+		"""Generate a proper ECDSA client signature matching the API server's verification logic."""
+		from cryptography.hazmat.primitives.asymmetric import ec
+		from cryptography.hazmat.primitives import hashes
+
+		# Create the exact message format matching frontend and API server verification.
+		# Frontend: JSON.stringify([filename, photo_id, timestamp], null, 0)  — raw unicode
+		# Server:   json.dumps(..., separators=(',',':'), ensure_ascii=False, sort_keys=True)
+		# ensure_ascii=False is critical: without it, non-ASCII filenames (emojis etc.)
+		# get \uXXXX-escaped, producing a different string than the server expects.
+		message_data = [filename, photo_id, timestamp]
+		message = json.dumps(message_data, separators=(',', ':'), ensure_ascii=False)
+
+		# Sign the message using the client's private key
+		signature_bytes = client_private_key.sign(
+			message.encode('utf-8'),
+			ec.ECDSA(hashes.SHA256())
+		)
+
+		# Return base64-encoded signature
+		return base64.b64encode(signature_bytes).decode('ascii')
+
+	def generate_client_keys(self):
+		"""Generate ECDSA key pair for client operations."""
+		if not self.client_keys:
+			private_key, public_key = generate_ecdsa_key_pair()
+			self.client_keys = {
+				"private_key": private_key,
+				"public_key": public_key,
+				"private_pem": serialize_private_key(private_key),
+				"public_pem": serialize_public_key(public_key)
+			}
+		return self.client_keys
+
+	async def register_client_key(self, auth_token: str, client_key_pair: dict = None):
+		"""Phase 1: Register client public key with the API server."""
+		if not client_key_pair:
+			client_key_pair = self.generate_client_keys()
+
+		# Test authentication first
+		async with httpx.AsyncClient() as client:
+			response = await client.get(
+				f"{self.api_url}/auth/me/",
+				headers={"Authorization": f"Bearer {auth_token}"},
+				follow_redirects=True,
+				# Match the sibling register-client-key POST below: without an
+				# explicit timeout httpx defaults to 5s, which a backend under a
+				# thundering herd of concurrent uploaders can't always answer in
+				# time — that 5s ReadTimeout was the spurious upload failure.
+				timeout=600_00.0,
+			)
+			if response.status_code != 200:
+				print(f"❌ Phase 1a failed: {response.status_code} - {response.text}")
+				raise Exception(f"Authentication test failed: {response.status_code} - {response.text}")
+			#print("✅ Phase 1a: Client authentication successful")
+
+			# Register client public key
+			key_id = client_key_pair.get("key_id", f"test-key-{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}-{str(uuid.uuid4())[:8]}")
+			response = await client.post(
+				f"{self.api_url}/auth/register-client-key",
+				json={
+					"public_key_pem": client_key_pair["public_pem"],
+					"key_id": key_id,
+					"created_at": datetime.datetime.now().isoformat()
+				},
+				headers={"Authorization": f"Bearer {auth_token}"},
+				timeout=600_00.0
+			)
+
+			if response.status_code in [200, 201]:
+				key_data = response.json()
+				#print(f"✅ Phase 1b: Client key registered successfully")
+				#print(f"✅  Key ID: {key_data.get('key_id', 'unknown')}")
+				# Store the key_id for later use
+				self.key_id = key_data.get('key_id', key_id)
+				return key_data
+			else:
+				raise Exception(f"Client key registration failed: {response.status_code} - {response.text}")
+
+	async def _request_upload_authorization(self, auth_token: str, upload_request: dict):
+		"""Internal method to make upload authorization request and handle response."""
+		async with httpx.AsyncClient() as client:
+
+			request_start_time = utcnow()
+
+			response = await client.post(
+				f"{self.api_url}/photos/authorize-upload",
+				json=upload_request,
+				headers={"Authorization": f"Bearer {auth_token}"},
+				timeout=600_00.0
+			)
+
+			request_end_time = utcnow()
+			request_duration = (request_end_time - request_start_time).total_seconds()
+			print(f"   Upload authorization request took {request_duration:.2f} seconds")
+
+
+			if response.status_code == 200:
+				auth_data = response.json()
+				if auth_data.get("duplicate"):
+					return auth_data
+				assert "upload_jwt" in auth_data
+				assert "worker_url" in auth_data
+				assert "photo_id" in auth_data
+				return auth_data
+			elif response.status_code == 404:
+				raise Exception("Upload authorization endpoint not implemented")
+			else:
+				raise Exception(f"Upload authorization failed: {response.status_code} - {response.text}")
+
+	async def authorize_upload(self, auth_token: str, filename: str = "secure_test.jpg", **kwargs):
+		"""Test Phase 2: Request upload authorization from API with default test values."""
+		auth_data = await self.authorize_upload_with_params(
+			auth_token=auth_token,
+			filename=filename,
+			file_size=5120,
+			latitude=50.0755,
+			longitude=14.4378,
+			description="End-to-end secure upload test",
+			is_public=True
+		)
+		print("✅ Phase 2: Upload authorization successful")
+		print(f"   Photo ID: {auth_data['photo_id']}")
+		print(f"   Worker URL: {auth_data['worker_url']}")
+		return auth_data
+
+	async def authorize_upload_with_params(self, auth_token: str, filename: str, file_size: int,
+										   latitude: float, longitude: float, description: str,
+										   is_public: bool = True, file_data: bytes = None,
+										   captured_at: str = None, version: int = None,
+										   license: str = 'ccbysa4+osm',
+										   title: str = None, keywords: list = None):
+		"""Request upload authorization with custom parameters.
+
+		Args:
+			captured_at: Optional ISO timestamp. If None, the server will extract it from EXIF.
+			             For test images without real EXIF, use generate_test_captured_at().
+			version: Optional version number. If >1, allows re-uploading completed photos.
+		"""
+
+		hash_start_time = utcnow()
+
+		if file_data:
+			file_md5 = hashlib.md5(file_data).hexdigest()
+		else:
+			file_md5 = hashlib.md5(f"{filename}_{file_size}".encode()).hexdigest()
+
+		hash_end_time = utcnow()
+		hash_duration = (hash_end_time - hash_start_time).total_seconds()
+		print(f"   Calculated file MD5: {file_md5} (took {hash_duration:.2f} seconds)")
+
+		upload_request = {
+			"filename": filename,
+			"content_type": get_content_type(filename),
+			"file_size": file_size,
+			"file_md5": file_md5,
+			"client_key_id": getattr(self, 'key_id', None),
+			"latitude": latitude,
+			"longitude": longitude,
+			"description": description,
+			"is_public": is_public,
+			"license": license,
+		}
+
+		# Only include title/keywords when set, so non-pipeline callers are unchanged.
+		if title is not None:
+			upload_request["title"] = title
+		if keywords is not None:
+			upload_request["keywords"] = keywords
+
+		# Only include captured_at if explicitly provided
+		if captured_at is not None:
+			upload_request["captured_at"] = captured_at
+
+		if version is not None:
+			upload_request["version"] = version
+
+		if not upload_request["client_key_id"]:
+			raise Exception("client_key_id is required - make sure to call register_client_key first")
+
+		return await self._request_upload_authorization(auth_token, upload_request)
+
+	async def upload_to_worker(self, file_input, auth_data, client_keys, filename="secure_test.jpg", timeout: float = 600_00.0, anonymization_override: str = None, quality: int = None, fast: bool = False, metadata: str = None):
+		"""Phase 3: Upload file to worker with proper client signature.
+
+		Args:
+			file_input: Either a file path (str) or file data (bytes)
+			anonymization_override: JSON string - None=auto, "[]"=skip anonymization
+			quality: WebP quality (1-100). None=use worker default (97).
+			fast: Skip pyramid, 640_llm, EXIF copy, use fast WebP encoding.
+			metadata: JSON string (BrowserMetadata schema) — lat/lon/bearing/etc
+			          fallback for formats that can't carry EXIF (e.g. EXR).
+		"""
+		upload_jwt = auth_data["upload_jwt"]
+		worker_url = auth_data["worker_url"]
+		photo_id = auth_data["photo_id"]
+
+		# Get timestamp - now comes as Unix timestamp directly
+		timestamp = auth_data["upload_authorized_at"]
+
+		client_signature = self.generate_client_signature(
+			client_keys["private_key"],
+			photo_id,
+			filename,
+			timestamp
+		)
+
+		async with httpx.AsyncClient() as client:
+			# Handle both file paths and file data
+			if isinstance(file_input, bytes):
+				# File data provided directly
+				files = {'file': (filename, file_input, 'image/jpeg')}
+			else:
+				# File path provided, read the file
+				with open(file_input, 'rb') as f:
+					file_data = f.read()
+				files = {'file': (filename, file_data, get_content_type(filename))}
+
+			data = {'client_signature': client_signature}
+			if anonymization_override is not None:
+				data['anonymization_override'] = anonymization_override
+			if quality is not None:
+				data['quality'] = str(quality)
+			if fast:
+				data['fast'] = 'true'
+			if metadata is not None:
+				data['metadata'] = metadata
+			headers = {
+				'Authorization': f'Bearer {upload_jwt}',
+				'Expect': '100-continue'
+			}
+
+			await self.test_worker_server_connectivity(worker_url)
+
+			# Backpressure-aware retry: a 503 (queue full) or a transport reset is
+			# the worker telling us it's busy, not that the upload failed. Retry
+			# with bounded jittered backoff so a bulk uploader can saturate the
+			# worker; any other non-200 (bad license/auth/payload) is permanent
+			# and re-raised at once. See the notes above _backpressure_delay.
+			budget_s = _upload_retry_budget_s()
+			waited_s = 0.0
+			attempt = 0
+			while True:
+				attempt += 1
+				try:
+					response = await client.post(
+						f"{worker_url}/upload",
+						files=files,
+						data=data,
+						headers=headers,
+						timeout=timeout
+					)
+				except httpx.TransportError as e:
+					delay = _backpressure_delay(attempt)
+					if waited_s + delay > budget_s:
+						raise WorkerUnavailableError(
+							f"Worker upload to {worker_url} kept hitting transport "
+							f"errors after {waited_s:.1f}s / {attempt} attempt(s): {e}"
+						) from e
+					await asyncio.sleep(delay)
+					waited_s += delay
+					continue
+
+				if response.status_code == 200:
+					return response.json()
+
+				if response.status_code == 503:
+					delay = _backpressure_delay(attempt)
+					if waited_s + delay > budget_s:
+						# Budget exhausted: surface the queue-full rather than lose
+						# it silently (fail fast at the boundary).
+						raise Exception(
+							f"Worker upload failed: 503 - still backpressured after "
+							f"{waited_s:.1f}s / {attempt} attempt(s): {response.text}"
+						)
+					await asyncio.sleep(delay)
+					waited_s += delay
+					continue
+
+				raise Exception(f"Worker upload failed: {response.status_code} - {response.text}")
+
+
+	async def test_worker_token_validation(self, test_user_auth):
+		"""Test that worker properly validates JWT authorization tokens."""
+		# First get a valid authorization to get the worker URL
+		auth_data = await self.authorize_upload(test_user_auth, "test.jpg")
+		worker_url = auth_data["worker_url"]
+
+		# Test with invalid token
+		async with httpx.AsyncClient() as client:
+			try:
+				fake_token = "invalid.jwt.token"
+				files = {'file': ('test.jpg', b'fake image', 'image/jpeg')}
+				data = {'client_signature': 'fake_sig'}
+				headers = {'Authorization': f'Bearer {fake_token}'}
+
+				response = await client.post(
+					f"{worker_url}/upload",
+					files=files,
+					data=data,
+					headers=headers
+				)
+
+				# Worker should reject invalid token
+				assert response.status_code == 401
+				print("✅ Worker correctly rejects invalid JWT tokens")
+
+			except httpx.ConnectError:
+				raise Exception("Worker not available")
+
+	async def test_api_server_connectivity(self):
+		"""Test basic API server health."""
+		async with httpx.AsyncClient() as client:
+			response = await client.get(f"{self.api_url}/debug")
+			assert response.status_code == 200
+			assert response.json()["status"] == "ok"
+
+	async def test_worker_server_connectivity(self, worker_url: str = None):
+		"""Test basic worker server health."""
+		if worker_url is None:
+			worker_url = os.getenv("TEST_WORKER_URL", "http://localhost:8056")
+		try:
+			async with httpx.AsyncClient() as client:
+				response = await client.get(f"{worker_url}/health", timeout=100.0)
+				if response.status_code == 200:
+					print(f"✅ Worker server is healthy ({worker_url})")
+				else:
+					print(f"⚠️ Worker server at {worker_url} returned {response.status_code}")
+		except httpx.ConnectError as e:
+			raise WorkerUnavailableError(f"Worker server not available at {worker_url} (from upload authorization): {e}") from None
+
+
+def get_content_type(filename: str) -> str:
+	"""Get content type based on file extension."""
+	ext = os.path.splitext(filename)[1].lower()
+	if ext in ['.jpg', '.jpeg']:
+		return 'image/jpeg'
+	elif ext == '.png':
+		return 'image/png'
+	elif ext == '.gif':
+		return 'image/gif'
+	elif ext == '.bmp':
+		return 'image/bmp'
+	elif ext == '.webp':
+		return 'image/webp'
+	elif ext in ['.tiff', '.tif']:
+		return 'image/tiff'
+	elif ext == '.exr':
+		return 'image/x-exr'
+	elif ext == '.cr2':
+		return 'image/x-canon-cr2'
+	else:
+		return 'application/octet-stream'
+
+
+if __name__ == "__main__":
+	# Run with: python -m pytest tests/test_secure_upload_workflow.py -v -s
+	pytest.main([__file__, "-v", "-s", "--tb=short"])

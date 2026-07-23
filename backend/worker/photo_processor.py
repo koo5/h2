@@ -1,0 +1,1176 @@
+"""
+photo processing service
+"""
+import asyncio
+import os
+import pathlib
+import json
+import logging
+import re
+import subprocess
+import shlex
+from typing import Optional, Dict, Any, List, Tuple
+from uuid import UUID
+from datetime import datetime, timezone, timedelta
+import cv2
+import numpy as np
+from PIL import Image
+import httpx
+from blur import read_image, apply_blackout, normalize_to_srgb
+from detections import should_blur
+from throttle import Throttle
+from pydantic import BaseModel
+from common.security_utils import sanitize_filename, validate_file_path, check_file_content, validate_image_dimensions, SecurityValidationError, validate_user_id, IMAGE_TOOL_TIMEOUT
+import processing_state
+from common.cdn_uploader import cdn_uploader
+from common.config import get_pics_url
+
+
+logger = logging.getLogger(__name__)
+
+os.environ["OPENCV_IMGCODECS_WEBP_MAX_FILE_SIZE"] = "209715200"  # 200MB
+
+PICS_URL = get_pics_url()
+PARALLEL_PROCESSING_START_DELAY = float(os.environ.get("PARALLEL_PROCESSING_START_DELAY", 5))
+logger.info(f"PARALLEL_PROCESSING_START_DELAY={PARALLEL_PROCESSING_START_DELAY} seconds")
+
+LLM_VARIANT_SIZE = 640
+WEBP_QUALITY_SIZES = 97
+WEBP_QUALITY_DZI = 97
+NORMAL_WEBP_METHOD = 6
+# WebP method: 0 = fastest, 6 = slowest/best compression. For fast encoding we
+# pick per-variant based on output pixel count: 1 is noticeably quicker than
+# 2, but it overflows partition 0 (libwebp error 6) on large images because
+# fast methods don't bother optimizing partition layout. ~45 MP (8192×5462,
+# the 'full' variant of a 5DS shot) is enough to trip it; 25 MP threshold
+# leaves the smaller variants on the fast path.
+FAST_WEBP_METHOD_SMALL = 1
+FAST_WEBP_METHOD_LARGE = 2
+FAST_WEBP_LARGE_THRESHOLD_PIXELS = 5000 * 5000
+
+
+def _fast_webp_method_for(width: int, height: int) -> int:
+	return FAST_WEBP_METHOD_LARGE if width * height >= FAST_WEBP_LARGE_THRESHOLD_PIXELS else FAST_WEBP_METHOD_SMALL
+
+
+def _save_webp(rgb_array, output_path: str, quality: int, method: int) -> None:
+	"""Save an RGB numpy array as WebP, re-raising encoding errors with diagnostics.
+
+	libwebp returns opaque numeric errors (e.g. "encoder error 6") via PIL.
+	Error 6 (VP8_ENC_ERROR_PARTITION0_OVERFLOW) is the one we hit in --fast
+	mode: methods 1-2 don't optimize the frame header layout, and on large/
+	complex images partition 0 won't fit in libwebp's 512KB cap. The fix is
+	either bump the encoding method (raise FAST_WEBP_LARGE_THRESHOLD_PIXELS
+	threshold's ceiling, or drop --fast) or shrink the image.
+	"""
+	h, w = rgb_array.shape[:2]
+	try:
+		Image.fromarray(rgb_array).save(output_path, format='WEBP', quality=quality, method=method)
+	except OSError as e:
+		msg = str(e)
+		if 'encoder error 6' in msg:
+			raise OSError(
+				f"WebP partition 0 overflow saving {w}x{h} (~{w*h/1e6:.1f} MP) at "
+				f"method={method}, quality={quality}. Fast methods can't pack the "
+				f"frame header into 512KB on images this size. Lower "
+				f"FAST_WEBP_LARGE_THRESHOLD_PIXELS in photo_processor.py so this "
+				f"variant uses method>=2, or re-run without --fast. Path: {output_path}"
+			) from e
+		raise OSError(
+			f"WebP save failed for {w}x{h} at method={method}, quality={quality}: {msg}. "
+			f"Path: {output_path}"
+		) from e
+
+
+def create_center_crop(image, target_width: int, target_height: int):
+	"""Resize and center-crop an image to exact target dimensions.
+
+	Scales the image so the smaller dimension matches the target,
+	then center-crops the larger dimension.
+
+	Args:
+		image: BGR numpy array (from cv2)
+		target_width: Desired output width in pixels
+		target_height: Desired output height in pixels
+
+	Returns:
+		Cropped BGR numpy array of exactly (target_height, target_width).
+	"""
+	h, w = image.shape[:2]
+	# Scale so that the dimension that would be cropped fills the target
+	scale = max(target_width / w, target_height / h)
+	# Use round() instead of int() to avoid floating-point truncation
+	# (e.g. int(7 * (240/7)) = 239 due to IEEE 754), then clamp to at
+	# least target dimensions so the center-crop slice is never short.
+	new_w = max(target_width, round(w * scale))
+	new_h = max(target_height, round(h * scale))
+	resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
+	x_start = (new_w - target_width) // 2
+	y_start = (new_h - target_height) // 2
+	return resized[y_start:y_start + target_height, x_start:x_start + target_width]
+
+
+class AnonymizationOverride(BaseModel):
+	"""Controls anonymization behavior.
+
+	- None (not provided): auto-detect faces/plates and blur them
+	- Empty list []: skip anonymization entirely
+	- List of rectangles: blur specific areas (future feature)
+	- Dict with an "objects" key: PRECOMPUTED detections — the
+	  detected_objects value from a previous processing of the same image
+	  bytes (e.g. copied from a dev server by the pics pipeline's
+	  apply_dev_ratings.py). The objects whose ``blurred`` flag (or the
+	  ``should_blur`` fallback for legacy entries) says so are blurred with
+	  their real class_ids (stick figures preserved), and the dict is
+	  persisted to ``detected_objects`` VERBATIM — class names, confidences,
+	  model_name and sub-threshold near-misses all survive for future
+	  re-anonymization / threshold tuning.
+	"""
+	rectangles: List[Dict[str, int]] = []  # Each dict: {x, y, width, height}
+	detections: Optional[Dict[str, Any]] = None  # verbatim detected_objects dict
+
+	@classmethod
+	def from_json_string(cls, json_str: Optional[str]) -> Optional["AnonymizationOverride"]:
+		"""Parse from JSON string (as received from form field)."""
+		if json_str is None:
+			return None
+		try:
+			data = json.loads(json_str)
+			if isinstance(data, list):
+				return cls(rectangles=data)
+			elif isinstance(data, dict):
+				if "objects" in data:
+					return cls(detections=data)
+				return cls(**data)
+			else:
+				logger.warning(f"Invalid anonymization_override type: {type(data)}")
+				return None
+		except json.JSONDecodeError as e:
+			logger.warning(f"Invalid anonymization_override JSON: {e}")
+			return None
+
+	@property
+	def skip_anonymization(self) -> bool:
+		"""Returns True if anonymization should be skipped (empty rectangles
+		list and no precomputed detections)."""
+		return self.detections is None and len(self.rectangles) == 0
+
+
+# Canonical definition lives in exceptions.py (lightweight module) so that
+# app.py can catch this without importing photo_processor at startup.
+from exceptions import PhotoDeletedException, PoolMigrationError
+
+
+def safe_parse_float(value, field_name: str = "value") -> Optional[float]:
+	"""Safely parse a numeric value from exiftool output.
+
+	Exiftool returns 'undef' when tags exist but can't be parsed
+	(e.g., malformed EXIF from format conversions like CR2->TIFF).
+	"""
+	if value is None:
+		return None
+	if isinstance(value, (int, float)):
+		return float(value)
+	if isinstance(value, str):
+		val_lower = value.lower().strip()
+		if val_lower in ('undef', 'undefined', '', 'nan', 'inf', '-inf', 'infinity', '-infinity'):
+			logger.debug(f"Exiftool returned '{value}' for {field_name}, treating as None")
+			return None
+		try:
+			return float(value)
+		except ValueError:
+			logger.warning(f"Could not parse exiftool value '{value}' as float for {field_name}")
+			return None
+	logger.warning(f"Unexpected type {type(value).__name__} for {field_name}: {value}")
+	return None
+
+
+def _parse_exif_offset(offset_value) -> Optional[timedelta]:
+	"""Parse an EXIF OffsetTime tag ('+01:00', '-05:00', 'Z') to a timedelta.
+
+	Returns None if absent/unparseable so the caller can fall back to assuming UTC.
+	"""
+	if offset_value is None:
+		return None
+	s = str(offset_value).strip()
+	if s in ('Z', 'z'):
+		return timedelta(0)
+	m = re.match(r"([+-])(\d{2}):?(\d{2})$", s)
+	if not m:
+		return None
+	sign = 1 if m.group(1) == '+' else -1
+	return timedelta(minutes=sign * (int(m.group(2)) * 60 + int(m.group(3))))
+
+
+def parse_exif_datetime(value, offset_value=None) -> Optional[datetime]:
+	"""Parse EXIF datetime value and fix corrupted timestamps.
+
+	Handles the bug where milliseconds were written as seconds, causing
+	dates like "+58074:03:14 04:05:17". Detects years > 2100 and fixes
+	by dividing the timestamp by 1000.
+
+	Returns a UTC datetime. EXIF DateTimeOriginal is a naive local wall-clock; if
+	offset_value (OffsetTimeOriginal, e.g. '+01:00') is given, the wall-clock is
+	converted to UTC. Without an offset we assume the value is already UTC (true for
+	the unix-ms path; best-effort otherwise).
+	"""
+	if value is None:
+		return None
+
+	# If it's already a numeric timestamp (exiftool -n can return these)
+	if isinstance(value, (int, float)):
+		ts = float(value)
+		# Check if this looks like milliseconds (year > 2100)
+		if ts > 4102444800:  # 2100-01-01 in seconds
+			ts = ts / 1000
+		return datetime.fromtimestamp(ts, tz=timezone.utc)
+
+	# String format - try to parse
+	value_str = str(value)
+
+	# Handle the corrupted format like "+58074:03:14 04:05:17"
+	# Strip leading + if present
+	if value_str.startswith('+'):
+		value_str = value_str[1:]
+
+	# Common EXIF datetime formats
+	formats = [
+		"%Y:%m:%d %H:%M:%S",      # Standard EXIF: 2024:01:15 10:30:45
+		"%Y-%m-%d %H:%M:%S",      # ISO-ish: 2024-01-15 10:30:45
+		"%Y:%m:%d %H:%M:%S.%f",   # With subseconds
+		"%Y-%m-%dT%H:%M:%S",      # ISO: 2024-01-15T10:30:45
+		"%Y-%m-%dT%H:%M:%S.%f",   # ISO with subseconds
+		"%Y-%m-%dT%H:%M:%SZ",     # ISO UTC
+	]
+
+	for fmt in formats:
+		try:
+			dt = datetime.strptime(value_str, fmt)
+			# Check if year is unreasonably large (corrupted timestamp)
+			if dt.year > 2100:
+				# This was milliseconds interpreted as seconds
+				# Convert back: parse to timestamp, divide by 1000
+				ts = dt.timestamp()
+				corrected_ts = ts / 1000
+				corrected_dt = datetime.fromtimestamp(corrected_ts, tz=timezone.utc)
+				logger.info(f"Fixed corrupted DateTimeOriginal: {value} -> {corrected_dt.isoformat()}")
+				return corrected_dt
+			# DateTimeOriginal is local wall-clock; convert to UTC using the EXIF
+			# offset when known, else assume it is already UTC.
+			offset = _parse_exif_offset(offset_value)
+			if offset is not None:
+				return (dt - offset).replace(tzinfo=timezone.utc)
+			return dt.replace(tzinfo=timezone.utc)
+		except ValueError:
+			continue
+
+	logger.warning(f"Could not parse DateTimeOriginal: {value}")
+	return None
+
+
+throttle = Throttle('photo_processor')
+
+class PhotoProcessor:
+	"""Unified photo processing service for uploads."""
+
+
+	def __init__(self, upload_dir: str = "/app/uploads"):
+		self.upload_dir = upload_dir
+
+
+	def extract_exif_data(self, filepath: str) -> Dict[str, Any]:
+		"""Extract EXIF data including GPS and bearing information using known-good implementation."""
+		logger.info(f"Processing EXIF data from {filepath}")
+
+		result = {
+			'exif': {},
+			'gps': {},
+			'debug': {
+				'has_exif': False,
+				'has_gps_coords': False,
+				'has_bearing': False,
+				'found_gps_tags': [],
+				'found_bearing_tags': [],
+				'parsing_errors': []
+			}
+		}
+
+		# First try exifread
+		# try:
+		# 	with open(filepath, 'rb') as f:
+		# 		tags = exifread.process_file(f, details=True, debug=False)
+		#
+		# 	if len(tags) > 0:
+		# 		result['debug']['has_exif'] = True
+		# 		logger.info(f"EXIF tags found: {len(tags)} tags")
+		# 		logger.info(f"All EXIF tags: {[str(tag) for tag in tags.keys()]}")
+		#
+		# 		# Extract basic EXIF data
+		# 		exif_dict = {}
+		# 		for tag in tags.keys():
+		# 			if tag not in ('JPEGThumbnail', 'TIFFThumbnail', 'Filename', 'EXIF MakerNote'):
+		# 				exif_dict[tag] = str(tags[tag])
+		# 		result['exif'] = exif_dict
+		#
+		# 		gps_data = {}
+		# 		bearing = None
+		# 		latitude = tags.get('GPS GPSLatitude')
+		# 		longitude = tags.get('GPS GPSLongitude')
+		#
+		# 		# Track what GPS tags we found
+		# 		if latitude:
+		# 			result['debug']['found_gps_tags'].append('GPS GPSLatitude')
+		# 		if longitude:
+		# 			result['debug']['found_gps_tags'].append('GPS GPSLongitude')
+		#
+		# 		# Check bearing data (any one of the possible keys) - independent of coordinates
+		# 		bearing_keys = ['GPS GPSImgDirection', 'GPS GPSTrack', 'GPS GPSDestBearing']
+		# 		for key in bearing_keys:
+		# 			if key in tags:
+		# 				bearing = tags.get(key)
+		# 				result['debug']['found_bearing_tags'].append(key)
+		# 				result['debug']['has_bearing'] = True
+		# 				break
+		#
+		# 		if latitude and longitude:
+		# 			result['debug']['has_gps_coords'] = True
+		#
+		# 			if bearing:
+		#
+		# 				try:
+		# 					altitude = tags.get('GPS GPSAltitude')
+		# 					logger.info(f"Found GPS data via exifread")
+		#
+		# 					# Convert coordinates to decimal degrees
+		# 					lat = self._convert_to_degrees(latitude)
+		# 					lon = self._convert_to_degrees(longitude)
+		#
+		# 					# Apply hemisphere corrections
+		# 					lat_ref = tags.get('GPS GPSLatitudeRef')
+		# 					lon_ref = tags.get('GPS GPSLongitudeRef')
+		# 					if lat_ref and str(lat_ref).upper().startswith('S'):
+		# 						lat = -lat
+		# 					if lon_ref and str(lon_ref).upper().startswith('W'):
+		# 						lon = -lon
+		#
+		# 					gps_data['latitude'] = lat
+		# 					gps_data['longitude'] = lon
+		# 					gps_data['bearing'] = float(str(bearing).split('/')[0]) if '/' in str(bearing) else float(str(bearing))
+		# 					if altitude:
+		# 						gps_data['altitude'] = float(str(altitude).split('/')[0]) if '/' in str(altitude) else float(str(altitude))
+		#
+		# 					result['gps'] = gps_data
+		# 					return result
+		# 				except Exception as e:
+		# 					result['debug']['parsing_errors'].append(f"GPS parsing failed: {e}")
+		# 					logger.debug(f"GPS parsing failed: {e}")
+		# except Exception as e:
+		# 	result['debug']['parsing_errors'].append(f"exifread failed: {e}")
+		# 	logger.debug(f"exifread failed: {e}")
+
+		# Fallback to exiftool
+		try:
+			# Validate filepath before passing to external tool
+			try:
+				validated_filepath = validate_file_path(filepath, "/app")
+			except SecurityValidationError as e:
+				result['debug']['parsing_errors'].append(f"Path validation failed for exiftool: {e}")
+				logger.debug(f"Path validation failed for exiftool: {e}")
+				return result
+
+			# Use -n flag to get raw numeric values instead of formatted strings
+			cmd = ['exiftool', '-json', '-n', validated_filepath]
+			logger.debug(f"Trying exiftool fallback: {shlex.join(cmd)}")
+
+			proc_result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+
+			if proc_result.returncode != 0:
+				result['debug']['parsing_errors'].append("exiftool command failed")
+				logger.debug(f"Error running exiftool: {proc_result.stderr}")
+				return result
+
+			data = json.loads(proc_result.stdout)[0]
+			result['data'] = data
+
+			# Check for required GPS data (use safe_parse_float to handle 'undef' etc.)
+			latitude = safe_parse_float(data.get('GPSLatitude'), 'GPSLatitude')
+			longitude = safe_parse_float(data.get('GPSLongitude'), 'GPSLongitude')
+			lat_ref = data.get('GPSLatitudeRef')
+			lon_ref = data.get('GPSLongitudeRef')
+
+			# Track what we found
+			if latitude is not None:
+				result['debug']['found_gps_tags'].append('GPSLatitude')
+			if longitude is not None:
+				result['debug']['found_gps_tags'].append('GPSLongitude')
+
+			if latitude is None or longitude is None:
+				result['debug']['has_gps_coords'] = False
+				logger.debug("No GPS coordinates found via exiftool.")
+			else:
+				result['debug']['has_gps_coords'] = True
+
+				# Apply sign based on reference
+				if lat_ref == 'S':
+					latitude = -abs(latitude)
+				if lon_ref == 'W':
+					longitude = -abs(longitude)
+
+			# Check bearing data
+			bearing_fields = ['GPSImgDirection', 'GPSTrack', 'GPSDestBearing']
+			bearing = None
+			for field in bearing_fields:
+				raw_bearing = data.get(field)
+				if raw_bearing is not None:
+					bearing = safe_parse_float(raw_bearing, field)
+					if bearing is not None:
+						result['debug']['found_bearing_tags'].append(field)
+						break
+
+			if bearing is None:
+				result['debug']['has_bearing'] = False
+				logger.debug("No bearing data found via exiftool")
+			else:
+				result['debug']['has_bearing'] = True
+
+			# Mark as having EXIF data if we found any GPS-related data (coordinates or bearing)
+			if result['debug']['found_gps_tags'] or result['debug']['found_bearing_tags']:
+				result['debug']['has_exif'] = True
+
+			altitude = safe_parse_float(data.get('GPSAltitude'), 'GPSAltitude')
+
+
+			# Validate bearing is in valid range [0, 360]
+			if bearing is not None and (bearing < 0 or bearing > 360):
+				error_msg = f"Invalid bearing value: {bearing}. Must be between 0 and 360 degrees."
+				result['debug']['parsing_errors'].append(error_msg)
+				logger.error(error_msg)
+				raise ValueError(error_msg)
+
+			gps_data = {
+				'latitude': latitude,
+				'longitude': longitude,
+				'bearing': bearing
+			}
+			if altitude:
+				gps_data['altitude'] = altitude
+
+			result['gps'] = gps_data
+
+		except Exception as e:
+			result['debug']['parsing_errors'].append(f"exiftool failed: {e}")
+			logger.debug(f"Error reading EXIF data from {filepath}: {e}")
+
+		return result
+
+
+	def _convert_to_degrees(self, value):
+		"""Convert GPS coordinates to decimal degrees."""
+		d, m, s = value.values
+		return float(d) + float(m)/60 + float(s)/3600
+
+	def has_required_gps_data(self, exif_data: Dict[str, Any]) -> bool:
+		"""Check if image has required GPS and bearing data."""
+		gps = exif_data.get('gps', {})
+		return all(key in gps for key in ['latitude', 'longitude', 'bearing'])
+
+
+	def get_image_dimensions(self, filepath: str, orientation: int
+							 ) -> Tuple[int, int]:
+		"""Get image dimensions using ImageMagick identify (known-good implementation)."""
+		try:
+			# Validate filepath before passing to external tool
+			validated_filepath = validate_file_path(filepath, "/app")
+		except SecurityValidationError as e:
+			logger.debug(f"Path validation failed for identify: {e}")
+			return 0, 0
+
+		cmd = ['identify', '-format', '%w %h', validated_filepath]
+		output = subprocess.check_output(cmd, timeout=IMAGE_TOOL_TIMEOUT).decode('utf-8')
+		dimensions = [int(x) for x in output.split()]
+		if orientation in [5, 6, 7, 8]:
+			dimensions = [dimensions[1], dimensions[0]]
+		logger.debug(f'Image dimensions: {dimensions}')
+		return dimensions[0], dimensions[1]
+
+
+	async def create_optimized_sizes(self, source_path: str, unique_id: str, width: int, height: int, photo_id: str = None, client_signature: str = None, anonymization_override: Optional[AnonymizationOverride] = None, quality: Optional[int] = None, fast: bool = False, encoding: Optional[str] = None,
+									 files_to_clean: Optional[List[str]] = None,
+									 ) -> tuple[Dict[str, Dict[str, Any]], Optional[Dict[str, Any]]]:
+		"""Create optimized versions with anonymization and unique IDs.
+
+		fast: Skip pyramid, 640_llm, EXIF copy, use fast WebP encoding, reduced size set.
+		encoding: EXR pixel encoding ('srgb'/'linear') sourced from upload metadata;
+			passed to read_image so it need not read the embedded header tag.
+		"""
+
+		sizes_info = {}
+		output_base = self.upload_dir
+		webp_quality_sizes = quality if quality is not None else WEBP_QUALITY_SIZES
+		webp_quality_dzi = quality if quality is not None else WEBP_QUALITY_DZI
+
+		logger.info(f"Starting anonymization for {unique_id} (quality: sizes={webp_quality_sizes}, dzi={webp_quality_dzi}, fast={fast})")
+
+		if not anonymization_override:
+			# this takes a while to import, so do it here dynamically
+			logger.info(f"Importing anonymization module for {source_path}")
+			from anonymize import anonymize_image as _  # noqa: F401
+			logger.info(f"Successfully imported anonymization module")
+
+		processing_state.set_phase("anonymizing")
+		async with throttle.rate_limit(PARALLEL_PROCESSING_START_DELAY, 1500):
+
+			if not anonymization_override:
+				image, detections = await self._anonymize_image(source_path, encoding=encoding)
+			else:
+				if anonymization_override.detections is not None:
+					# Precomputed detections: reuse another run's rects on the
+					# same bytes instead of re-running the detector, and
+					# persist the dict verbatim (provenance survives — see
+					# AnonymizationOverride). Blur decision per object follows
+					# the shared consumer convention (detections.py).
+					detections = anonymization_override.detections
+					objects = detections.get("objects") or []
+					to_blur = [o for o in objects if o.get("blurred", should_blur(o))]
+					logger.info(f"Applying precomputed detections for {unique_id}: "
+								f"blurring {len(to_blur)}/{len(objects)} objects")
+					image = read_image(source_path, encoding=encoding)
+					if to_blur:
+						from blur import apply_blur
+						apply_blur(source_path, image, to_blur)
+				elif anonymization_override.skip_anonymization:
+					logger.info(f"Skipping anonymization for {unique_id} due to override")
+					image = read_image(source_path, encoding=encoding)
+					detections = {"objects": [], "manual": True}
+				else:
+					logger.info(f"Applying manual anonymization for {unique_id} with rectangles: {anonymization_override.rectangles}")
+					image = read_image(source_path, encoding=encoding)
+					detections = {"objects": [], "manual": True}
+					for rect in anonymization_override.rectangles:
+						x = rect.get('x')
+						y = rect.get('y')
+						w = rect.get('width')
+						h = rect.get('height')
+						if None not in (x, y, w, h):
+							detections['objects'].append({
+								'class_id': None,
+								'bbox': {'x1': x, 'y1': y, 'x2': x+w, 'y2': y+h},
+								'blur': 500,
+								'blurred': True,  # manual override rects are always blurred
+							})
+					from blur import apply_blur
+					apply_blur(source_path, image, detections['objects'])
+
+
+			# Use actual image dimensions (may differ from EXIF width/height
+			# due to auto-rotation during pyvips loading)
+			height, width = image.shape[:2]
+
+			if fast:
+				size_variants = ['full', 320, 1200, 2048]
+			else:
+				size_variants = ['full', 320, 640, 1200, 2048, 3072, 4096]
+
+			processing_state.set_phase("encode_sizes")
+			for size in size_variants:
+
+				# skip if size is larger than original width
+				if isinstance(size, int) and size > width:
+					continue
+
+				user_id_part, photo_id_part = unique_id.split('/', 1)
+				user_id_part = validate_user_id(user_id_part)
+				size_dir = os.path.join(output_base, 'opt', str(size), user_id_part)
+				unique_filename = sanitize_filename(f"{photo_id_part}.webp")
+				output_file_path = validate_file_path(os.path.join(size_dir, unique_filename), output_base)
+				relative_path = os.path.relpath(output_file_path, output_base)
+				os.makedirs(pathlib.Path(output_file_path).parent, exist_ok=True)
+
+				size_info = {'path': relative_path}
+
+				if size == 'full':
+					scale = 1 if width <= 8192 else 8192 / width
+				else:
+					scale = size / width
+
+				new_width = int(width * scale)
+				new_height = int(height * scale)
+
+				logger.info(f"Creating size {size} for {unique_id}: {new_width}x{new_height} at {output_file_path}")
+				new_image = cv2.resize(image, (new_width, new_height), interpolation=cv2.INTER_AREA)
+				logger.debug(f"Resized image to {new_width}x{new_height} for size {size}")
+				new_image_rgb = cv2.cvtColor(new_image, cv2.COLOR_BGR2RGB)
+				logger.debug(f"Converted image to RGB color space for size {size}")
+				webp_method = _fast_webp_method_for(new_width, new_height) if fast else NORMAL_WEBP_METHOD
+				_save_webp(new_image_rgb, output_file_path, webp_quality_sizes, webp_method)
+				if not fast:
+					copy_exif_data(source_path, output_file_path)
+				logger.info(f"Created size {size} for {unique_id}: {new_width}x{new_height} at {output_file_path}")
+
+				size_info.update({
+					'width': new_width,
+					'height': new_height,
+					'url': await self._get_size_url(output_file_path, relative_path, photo_id, client_signature, files_to_clean)
+				})
+				sizes_info[size] = size_info
+
+		# Create cropped thumbnail variants for images wider than the target aspect ratio
+		crop_variants = [
+			('320_crop', 320, 240),
+			('1200_crop', 1200, 630),
+		]  # (key, width, height)
+		for crop_key, crop_tw, crop_th in crop_variants:
+			if height > 0 and width / height > crop_tw / crop_th:
+				cropped = create_center_crop(image, crop_tw, crop_th)
+
+				user_id_part, photo_id_part = unique_id.split('/', 1)
+				user_id_part = validate_user_id(user_id_part)
+				crop_dir = os.path.join(output_base, 'opt', crop_key, user_id_part)
+				unique_filename = sanitize_filename(f"{photo_id_part}.webp")
+				crop_file_path = validate_file_path(os.path.join(crop_dir, unique_filename), output_base)
+				crop_relative_path = os.path.relpath(crop_file_path, output_base)
+				os.makedirs(pathlib.Path(crop_file_path).parent, exist_ok=True)
+
+				cropped_rgb = cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB)
+				webp_method = _fast_webp_method_for(crop_tw, crop_th) if fast else NORMAL_WEBP_METHOD
+				_save_webp(cropped_rgb, crop_file_path, webp_quality_sizes, webp_method)
+				if not fast:
+					copy_exif_data(source_path, crop_file_path)
+				logger.info(f"Created {crop_key} for {unique_id}: {crop_tw}x{crop_th} at {crop_file_path}")
+
+				sizes_info[crop_key] = {
+					'path': crop_relative_path,
+					'width': crop_tw,
+					'height': crop_th,
+					'url': await self._get_size_url(crop_file_path, crop_relative_path, photo_id, client_signature, files_to_clean)
+				}
+
+		logger.info(f"Created {len(sizes_info)} size variants for {unique_id}")
+
+		if not fast:
+			# Create 640_llm variant (black fill over detections, no colors/stick figures, for LLM analysis)
+			# Use original size if image is smaller than LLM_VARIANT_SIZE
+			llm_image = read_image(source_path, encoding=encoding)
+			# Black out only the objects that were actually blurred — sub-threshold
+			# detections are recorded but stay visible (same policy as apply_blur).
+			# Prefer the persisted "blurred" flag; fall back to should_blur for legacy
+			# format-#1 records that predate it (see detections.py).
+			apply_blackout(llm_image, [o for o in detections.get("objects", [])
+			                           if o.get("blurred", should_blur(o))])
+			llm_h, llm_w = llm_image.shape[:2]
+
+			if llm_w <= LLM_VARIANT_SIZE:
+				llm_width = llm_w
+				llm_height = llm_h
+				llm_resized = llm_image
+			else:
+				llm_scale = LLM_VARIANT_SIZE / llm_w
+				llm_width = LLM_VARIANT_SIZE
+				llm_height = int(llm_h * llm_scale)
+				llm_resized = cv2.resize(llm_image, (llm_width, llm_height), interpolation=cv2.INTER_AREA)
+
+			user_id_part, photo_id_part = unique_id.split('/', 1)
+			user_id_part = validate_user_id(user_id_part)
+			llm_size_dir = os.path.join(output_base, 'opt', '640_llm', user_id_part)
+			llm_filename = sanitize_filename(f"{photo_id_part}.webp")
+			llm_output_path = validate_file_path(os.path.join(llm_size_dir, llm_filename), output_base)
+			llm_relative_path = os.path.relpath(llm_output_path, output_base)
+			os.makedirs(pathlib.Path(llm_output_path).parent, exist_ok=True)
+
+			llm_rgb = cv2.cvtColor(llm_resized, cv2.COLOR_BGR2RGB)
+			webp_method = _fast_webp_method_for(llm_width, llm_height) if fast else NORMAL_WEBP_METHOD
+			_save_webp(llm_rgb, llm_output_path, webp_quality_sizes, webp_method)
+			copy_exif_data(source_path, llm_output_path)
+			logger.info(f"Created 640_llm variant for {unique_id}: {llm_width}x{llm_height} at {llm_output_path}")
+
+			llm_url = await self._get_size_url(llm_output_path, llm_relative_path, photo_id, client_signature, files_to_clean)
+			sizes_info['640_llm'] = {
+				'path': llm_relative_path,
+				'width': llm_width,
+				'height': llm_height,
+				'url': llm_url
+			}
+
+		if not fast:
+			processing_state.set_phase("dzi_pyramid")
+			# Generate DZI pyramid from the anonymized image (not the original source)
+			# Store metadata inline in sizes['full']['pyramid'] so the client can
+			# initialise OpenSeadragon without an extra round-trip for the .dzi file.
+			if 'full' in sizes_info:
+				pyramid = await self.generate_dzi_pyramid(image, unique_id, photo_id, client_signature, quality=quality, files_to_clean=files_to_clean)
+				if pyramid:
+					sizes_info['full']['pyramid'] = pyramid
+
+		return sizes_info, detections
+
+
+
+	# Skip DZI pyramid generation for images where both dimensions are below this threshold
+	DZI_MIN_DIMENSION = 2048
+
+	async def generate_dzi_pyramid(self, image: np.ndarray, unique_id: str, photo_id: str = None, client_signature: str = None, quality: Optional[int] = None, files_to_clean: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
+		"""Generate a DZI (Deep Zoom Image) pyramid from an anonymized image.
+
+		Args:
+			image: Anonymized image as a numpy BGR array (already sRGB 8-bit).
+
+		Returns pyramid metadata dict for inline use by OpenSeadragon, or None if generation fails.
+		The metadata allows the client to open the deep-zoom viewer without a separate .dzi fetch.
+		"""
+		try:
+			h, w = image.shape[:2]
+			if max(w, h) < self.DZI_MIN_DIMENSION:
+				logger.info(f"Skipping DZI pyramid for {unique_id}: image ({w}x{h}) below {self.DZI_MIN_DIMENSION}px threshold")
+				return None
+
+			user_id_part, photo_id_part = unique_id.split('/', 1)
+			user_id_part = validate_user_id(user_id_part)
+			safe_photo_id = sanitize_filename(photo_id_part)
+
+			output_base = self.upload_dir
+			dzi_dir = validate_file_path(os.path.join(output_base, 'opt', 'dzi', user_id_part), output_base)
+			os.makedirs(dzi_dir, exist_ok=True)
+
+			# vips dzsave writes <base>.dzi + <base>_files/
+			dzi_output_base = os.path.join(dzi_dir, safe_photo_id)
+			dzi_file = dzi_output_base + '.dzi'
+			tiles_dir = dzi_output_base + '_files'
+
+			tile_size = 1024
+			overlap = 1
+
+			import pyvips
+			# Convert BGR numpy array to pyvips RGB image
+			logger.info(f"Generating DZI pyramid for {unique_id} from anonymized image ({w}x{h})")
+			rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+			img = pyvips.Image.new_from_memory(rgb.data, w, h, 3, 'uchar')
+			webp_quality_dzi = quality if quality is not None else WEBP_QUALITY_DZI
+			img.dzsave(dzi_output_base, tile_size=tile_size, overlap=overlap, suffix=f'.webp[Q={webp_quality_dzi}]')
+
+			logger.info(f"DZI generated for {unique_id}, uploading files")
+
+			# Upload the .dzi XML descriptor
+			dzi_relative = os.path.relpath(dzi_file, output_base)
+			dzi_url = await self._get_size_url(dzi_file, dzi_relative, photo_id, client_signature, files_to_clean)
+
+			# The .dzi URL determines which pool this pyramid lives on. The tile
+			# base URL is derived from it by string surgery, so every tile must
+			# land on the same pool — i.e. each tile's URL must be pool_base +
+			# its relative path. If the API switched its write pool mid-upload
+			# this breaks; we fail hard (PoolMigrationError) and the client retries.
+			if not dzi_url.endswith(dzi_relative):
+				raise PoolMigrationError(f"Unexpected .dzi URL shape for {unique_id}: {dzi_url} does not end with {dzi_relative}")
+			pool_base = dzi_url[:len(dzi_url) - len(dzi_relative)]
+
+			# Derive the tiles base URL from the dzi URL
+			# OpenSeadragon uses {tiles_url}/{level}/{col}_{row}.{format}
+			tiles_url_base = dzi_url.removesuffix('.dzi') + '_files'
+
+			# Upload all tile files
+			if os.path.exists(tiles_dir):
+				tile_count = 0
+				for level_name in sorted(os.listdir(tiles_dir)):
+					level_path = os.path.join(tiles_dir, level_name)
+					if not os.path.isdir(level_path):
+						continue
+					for tile_name in sorted(os.listdir(level_path)):
+						tile_path = os.path.join(level_path, tile_name)
+						if not os.path.isfile(tile_path):
+							continue
+						tile_relative = os.path.relpath(tile_path, output_base)
+						tile_url = await self._get_size_url(tile_path, tile_relative, photo_id, client_signature, files_to_clean)
+						if tile_url != pool_base + tile_relative:
+							raise PoolMigrationError(f"DZI tile for {unique_id} landed on a different pool than its .dzi: {tile_url} (expected base {pool_base})")
+						tile_count += 1
+				logger.info(f"Uploaded {tile_count} DZI tiles for {unique_id}")
+
+			return {
+				'type': 'dzi',
+				'dzi_url': dzi_url,
+				'tiles_url': tiles_url_base,
+				'tile_size': tile_size,
+				'overlap': overlap,
+				'format': 'webp',
+				'width': w,
+				'height': h,
+			}
+
+		except Exception as e:
+			# DZI is required (when the image is large enough to have one): a
+			# failure here fails the whole photo so the client retries, rather
+			# than silently producing a photo without deep zoom.
+			logger.error(f"DZI pyramid generation failed for {unique_id}: {e}", exc_info=True)
+			raise
+
+	async def _upload_file_to_api(self, file_path: str, relative_path: str, photo_id: str, client_signature: str) -> str:
+		"""Upload file to API server storage as a raw stream.
+
+		Sends the file as a raw body with metadata in headers,
+		avoiding multipart encoding (which causes sync spool I/O on the API server).
+
+		Returns the URL where the file can be accessed.
+		Raises PhotoDeletedException if photo was deleted during processing.
+		"""
+		api_url = os.getenv("API_URL")
+		if not api_url:
+			raise RuntimeError("API_URL environment variable is required for file uploads")
+		upload_url = f"{api_url}/photos/upload-file"
+
+		headers = {
+			'Content-Type': 'application/octet-stream',
+			'X-Photo-Id': photo_id,
+			'X-Relative-Path': relative_path,
+			'X-Client-Signature': client_signature,
+		}
+
+		try:
+			async with httpx.AsyncClient() as client:
+				max_retries = 5
+				with open(file_path, 'rb') as f:
+					file_data = f.read()
+				file_size = len(file_data)
+				logger.info(f"Uploading {relative_path} ({file_size} bytes) to API server")
+				for attempt in range(max_retries):
+					try:
+						response = await client.post(upload_url, content=file_data, headers=headers, timeout=360.0)
+					except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError) as e:
+						err_detail = f"{type(e).__name__}: {e}" if str(e) else f"{type(e).__name__}: {e.__cause__ or '(no detail)'}"
+						if attempt < max_retries - 1:
+							delay = 2 ** attempt
+							logger.warning(f"Connection error uploading {relative_path} (attempt {attempt+1}/{max_retries}): {err_detail}, retrying in {delay}s")
+							await asyncio.sleep(delay)
+							continue
+						logger.error(f"Connection error uploading {relative_path} after {max_retries} attempts: {err_detail}")
+						raise
+
+					if response.status_code == 410:
+						logger.info(f"Photo {photo_id} was deleted, aborting file upload for {relative_path}")
+						raise PhotoDeletedException(f"Photo {photo_id} was deleted during processing")
+
+					if response.status_code >= 500 and attempt < max_retries - 1:
+						delay = 2 ** attempt
+						logger.warning(f"Server error {response.status_code} uploading {relative_path} (attempt {attempt+1}/{max_retries}): {response.text}, retrying in {delay}s")
+						await asyncio.sleep(delay)
+						continue
+
+					response.raise_for_status()
+					break
+
+				logger.info(f"Successfully uploaded {relative_path} ({file_size} bytes) to API server")
+
+				# The API decides which storage pool the file lands on and returns
+				# its public URL. Fall back to PICS_URL for older API servers that
+				# don't return one yet, so the worker and API need not be upgraded
+				# in lockstep during a rolling deploy.
+				url = response.json().get("url")
+				if url:
+					return url
+				if PICS_URL:
+					return PICS_URL + relative_path
+				raise RuntimeError(f"API returned no url for {relative_path} and PICS_URL is not configured")
+
+		except PhotoDeletedException:
+			raise
+		except httpx.HTTPStatusError as e:
+			error_string = getattr(e, "response", None) and getattr(e.response, "text", None) or str(e)
+			logger.error(f"Failed to upload {relative_path} to API server: {error_string}")
+			raise RuntimeError(f"Failed to upload {relative_path} to API server: {error_string}")
+		except Exception as e:
+			error_string = getattr(e, "message", None) or str(e) or repr(e) or e.__class__.__name__
+			logger.error(f"Failed to upload {relative_path} to API server: {error_string}")
+			raise RuntimeError(f"Failed to upload {relative_path} to API server: {error_string}")
+
+	async def _get_size_url(self, file_path: str, relative_path: str, photo_id: str = None, client_signature: str = None, files_to_clean: Optional[List[str]] = None) -> str:
+		"""Get URL for a size variant - CDN upload, API server upload, or local only.
+
+		In the CDN/API modes the shipped copy is the product and the local
+		file under opt/ is an intermediate: it gets appended to
+		``files_to_clean`` (when given) so the caller's finally removes it.
+		Without this, every processed photo permanently duplicated its full
+		variant set in the worker's uploads volume. KEEP_PICS_IN_WORKER mode
+		is the exception — there the local file IS the served copy.
+		"""
+		keep_pics_in_worker = os.getenv("KEEP_PICS_IN_WORKER", "false").lower() in ("true", "1", "yes")
+		use_cdn = os.getenv("USE_CDN", "false").lower() in ("true", "1", "yes")
+
+		if keep_pics_in_worker:
+			# Keep files in worker, just return local URL
+			if PICS_URL:
+				return PICS_URL + relative_path
+			else:
+				raise RuntimeError("PICS_URL not configured for local file access")
+		elif use_cdn:
+			# Upload to CDN
+			if not os.getenv("BUCKET_NAME"):
+				raise RuntimeError("USE_CDN is true but BUCKET_NAME is not set")
+			cdn_url = cdn_uploader._upload_file(file_path, relative_path)
+			if not cdn_url:
+				raise RuntimeError(f"Failed to upload {relative_path} to CDN")
+			if files_to_clean is not None:
+				files_to_clean.append(file_path)
+			return cdn_url
+		elif photo_id and client_signature:
+			url = await self._upload_file_to_api(file_path, relative_path, photo_id, client_signature)
+			if files_to_clean is not None:
+				files_to_clean.append(file_path)
+			return url
+		elif not photo_id:
+			logger.error(f"Cannot upload {relative_path}: photo_id is None")
+			raise RuntimeError(f"photo_id is required for API upload of {relative_path}")
+		elif not client_signature:
+			logger.error(f"Cannot upload {relative_path}: client_signature is None")
+			raise RuntimeError(f"client_signature is required for API upload of {relative_path}")
+		else:
+			raise RuntimeError("No upload method configured: either set KEEP_PICS_IN_WORKER=true, USE_CDN=true (with BUCKET_NAME), or provide photo_id and client_signature for API upload")
+
+
+	async def _anonymize_image(self, source_path: str, encoding: Optional[str] = None) -> tuple[Optional[str], dict]:
+		"""Anonymize image by blurring people and vehicles.
+
+		encoding: EXR pixel encoding ('srgb'/'linear') from the upload metadata,
+		threaded down to read_image (the auto-anonymization path reads the source).
+
+		Returns:
+			tuple: (anonymized_path: Optional[str], detections: dict)
+		"""
+		from anonymize import anonymize_image
+		anonymized_path, detections = anonymize_image(source_path, encoding=encoding)
+		logger.info(f"Anonymization completed for {source_path}, detections: {detections}")
+		return anonymized_path, detections
+
+
+	async def process_uploaded_photo(
+		self,
+		file_path: str,
+		filename: str,
+		user_id: UUID,
+		photo_id: Optional[str] = None,
+		description: Optional[str] = None,
+		is_public: bool = True,
+		client_signature: Optional[str] = None,
+		anonymization_override: Optional[str] = None,
+		metadata: Optional[Dict[str, Any]] = None,
+		quality: Optional[int] = None,
+		fast: bool = False,
+		files_to_clean: Optional[List[str]] = None,
+	) -> Optional[Dict[str, Any]]:
+		"""Process a user-uploaded photo and return processing results.
+
+		anonymization_override: JSON string controlling anonymization behavior:
+			- None or "null": auto-detect faces/plates and blur them (default)
+			- "[]": skip anonymization entirely
+			- "[{...}]": use specific rectangles (future feature)
+			- '{"objects": [...], ...}': precomputed detected_objects — blur
+			  per the stored blurred flags and persist verbatim (see
+			  AnonymizationOverride)
+		fast: Skip pyramid, 640_llm, EXIF copy, use fast WebP encoding, reduced size set.
+		"""
+
+		validate_user_id(str(user_id))
+		unique_id = str(user_id) + '/' + str(photo_id)
+
+		# Sanitize filename
+		try:
+			safe_filename = sanitize_filename(filename)
+		except SecurityValidationError as e:
+			logger.error(f"Filename sanitization failed for {filename}: {e}")
+			raise ValueError(f"Invalid filename: {e}")
+
+		# Canon RAW (CR2): convert to TIFF so downstream PIL/cv2/exiftool see
+		# a standard image. Output is 8-bit sRGB (dcraw -T), which is what
+		# we want heading into WebP — 16-bit would be quantized away anyway.
+		# `-w` uses the camera white balance; we do NOT pass -4 (linear) since
+		# viewers then render the pixels dark/flat (see scripts/raw/notes).
+		#
+		# We rename to a .tiff extension (rather than overwriting in place)
+		# because ImageMagick's identify picks the reader from the suffix —
+		# a TIFF-content file with a .CR2 suffix triggers the CR2/DNG coder
+		# and fails. The CR2 is left on disk for the caller to clean up;
+		# the TIFF is appended to files_to_clean so the caller cleans it too.
+		if os.path.splitext(file_path)[1].lower() == '.cr2':
+			tiff_path = os.path.splitext(file_path)[0] + '.tiff'
+			with open(tiff_path, 'wb') as out:
+				dcraw_result = subprocess.run(
+					['dcraw', '-w', '-T', '-c', file_path],
+					stdout=out, stderr=subprocess.PIPE, timeout=IMAGE_TOOL_TIMEOUT,
+				)
+			if dcraw_result.returncode != 0 or os.path.getsize(tiff_path) == 0:
+				try:
+					os.unlink(tiff_path)
+				except OSError:
+					pass
+				err = dcraw_result.stderr.decode('utf-8', errors='replace').strip()[:500]
+				raise ValueError(f"dcraw CR2 conversion failed: {err or 'empty output'}")
+			if files_to_clean is not None:
+				files_to_clean.append(tiff_path)
+			# Carry EXIF/GPS/XMP/IPTC (incl. UserComment, DateTimeOriginal, Make,
+			# Model, LensModel, FocalLength, GPS*) from the CR2 onto the TIFF.
+			# Strip MakerNotes and embedded thumb/preview (they reference raw
+			# offsets that won't exist in the TIFF). Force Orientation=1 because
+			# dcraw has already physically rotated the pixels.
+			exif_result = subprocess.run([
+				'exiftool', '-overwrite_original',
+				'-TagsFromFile', file_path,
+				'-EXIF:all', '-GPS:all', '-XMP:all', '-IPTC:all',
+				'-MakerNotes=', '-ThumbnailImage=', '-PreviewImage=',
+				'-Orientation=1',
+				tiff_path,
+			], capture_output=True, text=True, timeout=60)
+			if exif_result.returncode != 0:
+				logger.warning(f"exiftool EXIF copy CR2->TIFF failed for {safe_filename}: {exif_result.stderr.strip()}")
+			file_path = tiff_path
+			logger.info(f"Converted CR2 to TIFF for {safe_filename} -> {tiff_path}")
+
+		# Verify file content matches image type
+		if not check_file_content(file_path, "image"):
+			logger.error(f"File content verification failed for {safe_filename}")
+			raise ValueError("Invalid image file content")
+
+		# Extract EXIF data
+		processing_state.set_phase("read_exif")
+		exif_data = self.extract_exif_data(file_path)
+		gps_data = exif_data.get('gps', {})
+		debug_info = exif_data.get('debug', {})
+
+		# If metadata is provided (e.g., from browser capture), use it to fill missing data
+		if metadata:
+			logger.info(f"Metadata provided: {metadata}")
+			logger.info(f"GPS data before merge: {gps_data}")
+
+			# Metadata WINS over embedded EXIF when present. The uploader reads
+			# the canonical .CR2.geo.xmp sidecar fresh at upload time and sends
+			# it here, whereas a file's embedded GPS can be stale (the pipeline
+			# no longer re-embeds geo by default — re-upload carries the fresh
+			# value via metadata instead of rewriting every file). So overwrite
+			# unconditionally when the metadata field is present; fall back to
+			# the embedded value only where metadata is silent.
+			if metadata.get('latitude') is not None:
+				gps_data['latitude'] = metadata['latitude']
+			if metadata.get('longitude') is not None:
+				gps_data['longitude'] = metadata['longitude']
+			if metadata.get('altitude') is not None:
+				gps_data['altitude'] = metadata['altitude']
+			if metadata.get('bearing') is not None:
+				gps_data['bearing'] = metadata['bearing']
+
+			logger.info(f"GPS data after merge: {gps_data}")
+
+			# Use metadata for orientation if not in EXIF
+			if metadata.get('orientation_code') and not exif_data['data'].get('Orientation'):
+				exif_data['data']['Orientation'] = metadata['orientation_code']
+
+			# Use capture time from metadata if not in EXIF
+			if metadata.get('captured_at') and not exif_data.get('data', {}).get('DateTimeOriginal'):
+				exif_data['data']['DateTimeOriginal'] = metadata['captured_at']
+
+			# Browser uploads carry no embedded EXIF, so synthesize the same
+			# UserComment provenance JSON that the Android (Rust) EXIF writer
+			# produces — landing location_source / bearing_source / alt_location in
+			# exif_data['data']['UserComment'] uniformly across both upload paths.
+			# ``v`` is the pipeline's metadata-semantics version (v2 == the
+			# clock-drift-corrected UTC DateTimeOriginal); panoramas carry no
+			# embedded UserComment, so the --metadata blob is their only channel
+			# for it. Guarded so a real embedded UserComment (Android, or a webp's
+			# geo.xmp-stamped one) is never clobbered.
+			if not exif_data.setdefault('data', {}).get('UserComment'):
+				provenance = {
+					k: metadata[k]
+					for k in ('location_source', 'bearing_source', 'alt_location', 'v')
+					if metadata.get(k) is not None
+				}
+				if provenance:
+					exif_data['data']['UserComment'] = json.dumps(provenance)
+
+		orientation = exif_data['data'].get('Orientation')
+
+		# Log detailed EXIF extraction results
+		logger.info(f"EXIF extraction for {safe_filename}:")
+		logger.info(f"  - has_exif: {debug_info.get('has_exif', False)}")
+		logger.info(f"  - has_gps_coords: {debug_info.get('has_gps_coords', False)}")
+		logger.info(f"  - has_bearing: {debug_info.get('has_bearing', False)}")
+		logger.info(f"  - found_gps_tags: {debug_info.get('found_gps_tags', [])}")
+		logger.info(f"  - found_bearing_tags: {debug_info.get('found_bearing_tags', [])}")
+		logger.info(f"  - parsing_errors: {debug_info.get('parsing_errors', [])}")
+		logger.info(f"  - GPS data: {gps_data}")
+		logger.info(f"  - Orientation: {orientation}")
+
+		# Validate required data (from either EXIF or metadata)
+		if not gps_data.get('latitude') or gps_data.get('longitude') is None:
+			if not debug_info.get('has_exif'):
+				error_msg = "No EXIF data found in image file"
+			else:
+				found_tags = debug_info.get('found_bearing_tags', [])
+				if found_tags:
+					error_msg = f"GPS coordinates missing (found bearing tags: {', '.join(found_tags)}; need GPSLatitude, GPSLongitude)"
+				else:
+					error_msg = "GPS coordinates missing from photo (no GPS tags found in EXIF)"
+			logger.warning(f"No GPS coordinates in {safe_filename}: {error_msg}")
+			raise ValueError(error_msg)
+
+		if gps_data.get('bearing') is None:
+			found_tags = debug_info.get('found_gps_tags', [])
+			if found_tags:
+				error_msg = f"Compass direction missing (found GPS tags: {', '.join(found_tags)}; need GPSImgDirection, GPSTrack, or GPSDestBearing)"
+			else:
+				error_msg = "Compass bearing missing from photo"
+			logger.warning(f"No bearing data in {safe_filename}: {error_msg}")
+			raise ValueError(error_msg)
+
+		# Get image dimensions
+		width, height = self.get_image_dimensions(file_path, orientation)
+
+		# Validate image dimensions to prevent resource exhaustion
+		if not validate_image_dimensions(width, height):
+			error_msg = f"Image size too large or invalid ({width}x{height}). Please use a smaller image."
+			logger.error(f"Image dimensions validation failed for {safe_filename}: {width}x{height}")
+			raise ValueError(error_msg)
+
+		# Parse anonymization override from JSON string to Pydantic model
+		override = AnonymizationOverride.from_json_string(anonymization_override)
+		# EXR encoding carried out of band in the upload metadata (the
+		# .exr.encoding sidecar value); read_image falls back to the embedded
+		# header tag when this is absent.
+		encoding = metadata.get('encoding') if metadata else None
+		sizes_info, detections = await self.create_optimized_sizes(file_path, unique_id, width, height, photo_id, client_signature, override, quality=quality, fast=fast, encoding=encoding, files_to_clean=files_to_clean)
+
+		# Extract captured_at from EXIF DateTimeOriginal (with corruption fix)
+		raw_data = exif_data.get('data', {})
+		captured_at_raw = raw_data.get('DateTimeOriginal') or raw_data.get('CreateDate')
+		offset_raw = raw_data.get('OffsetTimeOriginal') or raw_data.get('OffsetTimeDigitized') or raw_data.get('OffsetTime')
+		captured_at_dt = parse_exif_datetime(captured_at_raw, offset_raw)
+		captured_at = captured_at_dt.isoformat() if captured_at_dt else None
+
+		# Return processing results for database creation
+		return {
+			'filename': safe_filename,
+			'exif_data': exif_data,
+			'width': width,
+			'height': height,
+			'latitude': gps_data.get('latitude'),
+			'longitude': gps_data.get('longitude'),
+			'compass_angle': gps_data.get('bearing'),
+			'altitude': gps_data.get('altitude'),
+			'sizes': sizes_info,  # Worker expects 'sizes', not 'sizes_info'
+			'detected_objects': detections,
+			'description': description,
+			'is_public': is_public,
+			'user_id': user_id,
+			'captured_at': captured_at
+		}
+
+
+def copy_exif_data(source_path, output_path):
+	# Copy EXIF data from source to output using exiftool
+	# Reset orientation tag to 1 (normal orientation) because image has been loaded and saved anew
+	# any other tags we might want to fix up?
+	cmd = ['exiftool', '-overwrite_original', '-TagsFromFile', source_path, '-all:all', '-EXIF:Orientation=', output_path]
+	logging.debug(f"Preserving EXIF data from {os.path.basename(source_path)} to anonymized version: {shlex.join(cmd)}")
+	result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+	if result.returncode == 0:
+		logging.info(f"Successfully preserved all EXIF metadata in anonymized image: {os.path.basename(output_path)}")
+	else:
+		logging.warning(f"Failed to preserve EXIF metadata in {os.path.basename(output_path)}: {result.stderr}")
+
+
+# Global instance
+photo_processor = PhotoProcessor()

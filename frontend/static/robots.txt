@@ -1,0 +1,47 @@
+Sitemap: https://hillview.cz/sitemap.xml
+
+User-agent: *
+Allow: /$
+Allow: /about
+Allow: /privacy
+Allow: /terms
+Allow: /licensing
+Allow: /download
+Allow: /contact
+Allow: /bestof
+Allow: /activity
+Allow: /photo/
+Disallow: /api/
+Disallow: /auth/
+Disallow: /oauth/
+Disallow: /login
+Disallow: /photos
+Disallow: /account
+Disallow: /account-deletion
+Disallow: /device-photos
+Disallow: /hidden
+Disallow: /settings/
+Disallow: /users/
+Disallow: /tile
+
+# AI answer/search crawlers — OAI-SearchBot, ChatGPT-User (OpenAI), Claude-SearchBot,
+# Claude-User (Anthropic), PerplexityBot — are intentionally ALLOWED: they aren't
+# listed here, so they fall under "User-agent: *" above (same access as Googlebot)
+# and power citations in ChatGPT/Claude/Perplexity answers.
+#
+# The crawlers below are AI *training* bots. Blocking ClaudeBot/GPTBot does NOT
+# affect the answer engines above. (Training policy TBD — to allow, delete a block.)
+User-agent: GPTBot
+Disallow: /
+
+User-agent: CCBot
+Disallow: /
+
+User-agent: Google-Extended
+Disallow: /
+
+User-agent: anthropic-ai
+Disallow: /
+
+User-agent: ClaudeBot
+Disallow: /

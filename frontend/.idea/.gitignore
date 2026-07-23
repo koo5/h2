@@ -1,0 +1,20 @@
+# Default ignored files
+/shelf/
+/workspace.xml
+# Editor-based HTTP Client requests
+/httpRequests/
+# Datasource local storage ignored files
+/dataSources/
+/dataSources.local.xml
+/copilotDiffState.xml
+caches
+/data_source_mapping.xml
+copilot*
+/queries
+# Datasource local storage ignored files
+/dataSources/
+/dataSources.local.xml
+/dataSources.xml
+/db-forest-config.xml
+/compiler.xml
+/copilot.data.migration.*

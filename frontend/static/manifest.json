@@ -1,0 +1,82 @@
+{
+  "name": "Hillview",
+  "short_name": "Hillview",
+  "description": "Photo mapping application",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#4a90e2",
+  "orientation": "any",
+  "icons": [
+    {
+      "src": "/icons/32x32.png",
+      "sizes": "32x32",
+      "type": "image/png"
+    },
+    {
+      "src": "/icons/64x64.png",
+      "sizes": "64x64",
+      "type": "image/png"
+    },
+    {
+      "src": "/icons/128x128.png",
+      "sizes": "128x128",
+      "type": "image/png"
+    },
+    {
+      "src": "/icons/icon.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/icons/icon.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ],
+  "categories": ["photo", "navigation", "utilities"],
+  "screenshots": [
+    {
+      "src": "https://hillview.cz/docs/screenshots/mobile/hero-panorama.png",
+      "sizes": "1170x1992",
+      "type": "image/png",
+      "form_factor": "narrow",
+      "label": "Explore annotated panoramas with labeled landmarks"
+    },
+    {
+      "src": "https://hillview.cz/docs/screenshots/mobile/07-best-of.png",
+      "sizes": "1170x1992",
+      "type": "image/png",
+      "form_factor": "narrow",
+      "label": "Browse top-rated photos and panoramas"
+    },
+    {
+      "src": "https://hillview.cz/docs/screenshots/desktop/hero-panorama-full.png",
+      "sizes": "2880x1800",
+      "type": "image/png",
+      "form_factor": "wide",
+      "label": "Zoom into panoramas with detailed annotations"
+    },
+    {
+      "src": "https://hillview.cz/docs/screenshots/desktop/12-bearing-lines.png",
+      "sizes": "2880x1800",
+      "type": "image/png",
+      "form_factor": "wide",
+      "label": "Triangulate distant landmarks with bearing lines"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "Take Photo",
+      "url": "/?activity=capture",
+      "icons": [{ "src": "/icons/64x64.png", "sizes": "64x64" }]
+    },
+    {
+      "name": "My Photos",
+      "url": "/photos",
+      "icons": [{ "src": "/icons/64x64.png", "sizes": "64x64" }]
+    }
+  ]
+}

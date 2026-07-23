@@ -1,0 +1,169 @@
+import { test, expect } from './fixtures';
+import { recreateTestUsers, loginAsTestUser } from './helpers/testUsers';
+import { configureAutoUploadFromPrompt } from './helpers/autoUpload';
+import { addCameraInitScript } from './helpers/cameraSetup';
+
+import {
+	getPhotoCount,
+	waitForPhotoCount,
+	getLatestPhoto,
+	waitForUploadedCount,
+	getAllPhotosDetailed
+} from './helpers/indexedDbPhotos';
+
+test.describe('Browser Capture → Upload', () => {
+	test.describe.configure({ mode: 'serial' });
+
+	// Each test captures + uploads — need per-test isolation
+	test.beforeEach(async ({ page, browserName }) => {
+		test.skip(browserName !== 'chromium', 'Fake camera only works in Chromium');
+		await recreateTestUsers();
+		await addCameraInitScript(page);
+	});
+
+	test('capture photo before login, login triggers auto-upload, photo appears on server', async ({ page, testUsers }) => {
+		test.setTimeout(180_000);
+		// Navigate to main page (not logged in)
+		await page.goto('/');
+		// No networkidle wait here: the unauthenticated '/' view fires a batch of
+		// zoom-20 map-tile requests that can hang indefinitely, so networkidle never
+		// settles. The camera-button waitFor below is the real readiness gate.
+
+		// Open camera
+		const cameraButton = page.locator('[data-testid="camera-button"]');
+		await cameraButton.waitFor({ state: 'visible', timeout: 11*15000 });
+		await cameraButton.click({ force: true });
+
+		// Wait for capture button to be ready
+		const captureButton = page.locator('[data-testid="single-capture-button"]');
+		await captureButton.waitFor({ state: 'visible', timeout: 11*15000 });
+		await expect(captureButton).toBeEnabled({ timeout: 11*15000 });
+
+		// Confirm no photos yet
+		const initialCount = await getPhotoCount(page);
+		expect(initialCount).toBe(0);
+
+		// Capture a photo
+		await captureButton.click();
+		await waitForPhotoCount(page, 1);
+
+		// Verify photo is pending (not uploaded — we're not logged in)
+		const photo = await getLatestPhoto(page);
+		expect(photo).not.toBeNull();
+		expect(photo!.blobSize).toBeGreaterThan(0);
+		expect(photo!.status).toBe('pending');
+		expect(photo!.server_photo_id).toBeNull();
+		expect(photo!.latitude).toBeCloseTo(50.11692, 3);
+		expect(photo!.longitude).toBeCloseTo(14.48837, 3);
+
+		// Auto-upload prompt appears — configure: license + enable
+		await configureAutoUploadFromPrompt(page);
+
+		// Login — this triggers triggerPhotoSync() via auth subscription in captureQueue.ts
+		await loginAsTestUser(page, testUsers.passwords.test);
+
+		// Wait for auto-upload to complete (IndexedDB status changes to 'processing' or 'completed')
+		await waitForUploadedCount(page, 1);
+
+		// Verify IndexedDB photo is now uploaded with server_photo_id
+		const uploadedPhoto = await getLatestPhoto(page);
+		expect(uploadedPhoto).not.toBeNull();
+		expect(['processing', 'completed']).toContain(uploadedPhoto!.status);
+		expect(uploadedPhoto!.server_photo_id).toBeTruthy();
+		const expectedPhotoId = uploadedPhoto!.server_photo_id;
+
+		// Navigate to My Photos and verify photo appears on server
+		await page.goto('/photos');
+
+		// Click refresh if photos aren't loaded yet
+		const refreshButton = page.locator('[data-testid="refresh-photos-button"]');
+		if (await refreshButton.isVisible()) {
+			await refreshButton.click();
+		}
+
+		// Wait for photos list and verify our specific photo is present
+		const photosList = page.locator('[data-testid="photos-list"]');
+		await photosList.waitFor({ state: 'visible', timeout: 11*15000 });
+
+		const ourPhoto = photosList.locator(`[data-photo-id="${expectedPhotoId}"]`);
+		await expect(ourPhoto.first()).toBeVisible({ timeout: 11*10000 });
+	});
+
+	test('subsequent photo after login uploads automatically', async ({ page, testUsers }) => {
+		test.setTimeout(180_000);
+		// Clean slate: clear server photos from test 1
+		await recreateTestUsers();
+
+		// Login first
+		await loginAsTestUser(page, testUsers.passwords.test);
+		await page.goto('/');
+
+		// Open camera
+		const cameraButton = page.locator('[data-testid="camera-button"]');
+		await cameraButton.waitFor({ state: 'visible', timeout: 11*15000 });
+		await cameraButton.click({ force: true });
+
+		const captureButton = page.locator('[data-testid="single-capture-button"]');
+		await captureButton.waitFor({ state: 'visible', timeout: 11*15000 });
+		await expect(captureButton).toBeEnabled({ timeout: 11*15000 });
+
+		// Capture first photo — auto-upload not configured yet
+		await captureButton.click();
+		await waitForPhotoCount(page, 1);
+
+		// Auto-upload prompt appears — configure: license + enable
+		await configureAutoUploadFromPrompt(page);
+
+		// First photo should now upload (logged in + auto-upload enabled)
+		await waitForUploadedCount(page, 1);
+
+		const photo1 = await getLatestPhoto(page);
+		expect(photo1).not.toBeNull();
+		expect(['processing', 'completed']).toContain(photo1!.status);
+		expect(photo1!.server_photo_id).toBeTruthy();
+
+		// Go back to camera for second capture
+		await page.goto('/');
+		await cameraButton.waitFor({ state: 'visible', timeout: 11*15000 });
+		await cameraButton.click({ force: true });
+		await captureButton.waitFor({ state: 'visible', timeout: 11*15000 });
+		await expect(captureButton).toBeEnabled({ timeout: 11*15000 });
+
+		// Capture second photo — should upload automatically (already configured)
+		await captureButton.click();
+		await waitForPhotoCount(page, 2);
+		await waitForUploadedCount(page, 2);
+
+		const allPhotos = await getAllPhotosDetailed(page);
+		const uploadedPhotos = allPhotos.filter(p => p.status === 'processing' || p.status === 'completed');
+		expect(uploadedPhotos.length).toBe(2);
+		expect(uploadedPhotos[0].server_photo_id).toBeTruthy();
+		expect(uploadedPhotos[1].server_photo_id).toBeTruthy();
+
+		// Collect the server_photo_ids we expect to find
+		const expectedIds = new Set(uploadedPhotos.map(p => p.server_photo_id));
+
+		// Close camera and verify photos on server
+		await cameraButton.click({ force: true });
+		await page.goto('/photos');
+
+		const refreshButton = page.locator('[data-testid="refresh-photos-button"]');
+		if (await refreshButton.isVisible()) {
+			await refreshButton.click();
+		}
+
+		const photosList = page.locator('[data-testid="photos-list"]');
+		await photosList.waitFor({ state: 'visible', timeout: 11*15000 });
+
+		const photoItems = photosList.locator(':scope > *');
+		await expect(photoItems.first()).toBeVisible({ timeout: 11*10000 });
+
+		// Verify the exact photos we uploaded appear on the server
+		const serverPhotoIds = await photosList.locator('[data-photo-id]').evaluateAll(
+			els => els.map(el => el.getAttribute('data-photo-id'))
+		);
+		for (const expectedId of expectedIds) {
+			expect(serverPhotoIds, `server should contain photo ${expectedId}`).toContain(expectedId);
+		}
+	});
+});

@@ -1,0 +1,276 @@
+"""
+Central configuration management for the Hillview backend API.
+
+This module handles all environment variable loading and provides
+typed configuration objects for different parts of the application.
+"""
+
+# Import environment initialization first
+from . import env_init  # noqa: F401 - side effect import
+
+import os
+import json
+import logging
+from pathlib import Path
+from typing import Dict, Any, List, Optional
+from dataclasses import dataclass
+
+logger = logging.getLogger(__name__)
+
+def is_rate_limiting_disabled() -> bool:
+	"""Check if rate limiting is globally disabled."""
+	return os.getenv("NO_LIMITS", "false").lower() in ("true", "1", "yes")
+
+def get_cors_origins() -> List[str]:
+	"""Get the allowed CORS origins for the application."""
+	return [
+		"http://localhost:3000",
+		"http://localhost:8212",
+		"http://localhost:4173",
+		"http://127.0.0.1:8212",
+		"http://tauri.localhost",
+		"https://hillview.cz",
+		"https://api.hillview.cz",
+		"https://api.ipv4.hillview.cz",
+	]
+
+def get_pics_dir() -> Path:
+	"""Get the pics directory path from environment."""
+	return Path(os.getenv("PICS_DIR", "/app/pics"))
+
+def get_pics_url() -> str:
+	"""Get the pics URL prefix from environment."""
+	return os.getenv("PICS_URL", "")
+
+
+# Storage pool registry
+# ---------------------
+# FILE_POOLS is a JSON array describing every storage location photos may live in.
+# Each entry is a pool keyed by its public base URL:
+#   files pool: {"type":"files","url":"https://pics.hillview.cz/","path":"/app/pics"}
+#   cdn pool:   {"type":"cdn","url":"https://cdn/","bucket":"b","endpoint":"https://s3",
+#                "secrets_file":"/run/secrets/cdn","addressing_style":"virtual"}
+# New local uploads are written to the first files-type pool; the remaining entries
+# exist so existing photos stay resolvable (for deletion) by matching their URL.
+# When FILE_POOLS is unset we synthesise the registry from the legacy single-pool
+# env (PICS_URL/PICS_DIR) plus the CDN env (CDN_BASE_URL/BUCKET_NAME) when configured,
+# so existing deployments need no new configuration.
+
+_file_pools_cache: Optional[List[Dict[str, Any]]] = None
+
+def get_file_pools() -> List[Dict[str, Any]]:
+	"""Return the ordered list of storage pools (parsed once)."""
+	global _file_pools_cache
+	if _file_pools_cache is not None:
+		return _file_pools_cache
+
+	raw = os.getenv("FILE_POOLS")
+	if raw:
+		pools = json.loads(raw)
+		for pool in pools:
+			pool.setdefault("type", "files")
+	else:
+		pools = [{"type": "files", "url": get_pics_url(), "path": str(get_pics_dir())}]
+		cdn_base_url = os.getenv("CDN_BASE_URL")
+		bucket_name = os.getenv("BUCKET_NAME")
+		if cdn_base_url and bucket_name:
+			pools.append({
+				"type": "cdn",
+				"url": cdn_base_url,
+				"bucket": bucket_name,
+				"endpoint": os.getenv("AWS_ENDPOINT_URL_S3"),
+			})
+
+	logger.info(f"Storage pools: {[(p.get('type'), p.get('url')) for p in pools]}")
+	_file_pools_cache = pools
+	return pools
+
+def get_write_pool() -> Dict[str, Any]:
+	"""Return the pool new local uploads are written to (first files-type pool)."""
+	for pool in get_file_pools():
+		if pool.get("type", "files") == "files":
+			return pool
+	raise RuntimeError("No files-type pool configured in FILE_POOLS")
+
+def resolve_pool_for_url(url: str) -> Optional[Dict[str, Any]]:
+	"""Find the pool a stored URL belongs to (longest matching base URL wins)."""
+	if not url:
+		return None
+	best = None
+	for pool in get_file_pools():
+		base = pool.get("url") or ""
+		if base and url.startswith(base) and (best is None or len(base) > len(best.get("url") or "")):
+			best = pool
+	return best
+
+@dataclass
+class RateLimitConfig:
+	"""Configuration for different types of rate limiting."""
+
+	# Mapillary API rate limiting
+	mapillary_rate_limit_seconds: float
+
+	# Authentication rate limiting
+	auth_max_attempts: int
+	auth_window_minutes: int
+	auth_lockout_minutes: int
+
+	# Photo upload limits (per user)
+	photo_upload_max_requests: int
+	photo_upload_window_hours: int
+
+	# Photo operations limits (per user)
+	photo_ops_max_requests: int
+	photo_ops_window_hours: int
+
+	# User profile limits (per user)
+	user_profile_max_requests: int
+	user_profile_window_hours: int
+
+	# General API limits (per IP)
+	general_api_max_requests: int
+	general_api_window_hours: int
+
+	# Public read limits (per IP)
+	public_read_max_requests: int
+	public_read_window_hours: int
+
+	# Activity feed limits (per IP)
+	activity_recent_max_requests: int
+	activity_recent_window_hours: int
+
+	# User registration limits (per IP)
+	user_registration_max_requests: int
+	user_registration_window_hours: int
+
+	# Worker-to-API limits (per IP)
+	worker_upload_max_requests: int
+	worker_upload_window_hours: int
+
+	# Debug endpoints limits (per IP)
+	debug_max_requests: int
+	debug_window_hours: int
+
+	@classmethod
+	def from_env(cls) -> 'RateLimitConfig':
+		"""Load configuration from environment variables."""
+
+		logger.info("Loading rate limit configuration from environment variables")
+
+		return cls(
+			# Mapillary
+			mapillary_rate_limit_seconds=float(os.getenv('MAPILLARY_RATE_LIMIT_SECONDS', '1.0')),
+
+			# Authentication
+			auth_max_attempts=int(os.getenv('AUTH_MAX_ATTEMPTS', '5')),
+			auth_window_minutes=int(os.getenv('AUTH_WINDOW_MINUTES', '15')),
+			auth_lockout_minutes=int(os.getenv('AUTH_LOCKOUT_MINUTES', '30')),
+
+			# Photo upload
+			photo_upload_max_requests=int(os.getenv('RATE_LIMIT_PHOTO_UPLOAD', '10')),
+			photo_upload_window_hours=int(os.getenv('RATE_LIMIT_PHOTO_UPLOAD_WINDOW', '1')),
+
+			# Photo operations
+			photo_ops_max_requests=int(os.getenv('RATE_LIMIT_PHOTO_OPS', '100')),
+			photo_ops_window_hours=int(os.getenv('RATE_LIMIT_PHOTO_OPS_WINDOW', '1')),
+
+			# User profile
+			user_profile_max_requests=int(os.getenv('RATE_LIMIT_USER_PROFILE', '50')),
+			user_profile_window_hours=int(os.getenv('RATE_LIMIT_USER_PROFILE_WINDOW', '1')),
+
+			# General API
+			general_api_max_requests=int(os.getenv('RATE_LIMIT_GENERAL_API', '6000')),
+			general_api_window_hours=int(os.getenv('RATE_LIMIT_GENERAL_API_WINDOW', '1')),
+
+			# Public read
+			public_read_max_requests=int(os.getenv('RATE_LIMIT_PUBLIC_READ', '500')),
+			public_read_window_hours=int(os.getenv('RATE_LIMIT_PUBLIC_READ_WINDOW', '1')),
+
+			# Activity feed
+			activity_recent_max_requests=int(os.getenv('RATE_LIMIT_ACTIVITY_RECENT', '5000')),
+			activity_recent_window_hours=int(os.getenv('RATE_LIMIT_ACTIVITY_RECENT_WINDOW', '1')),
+
+			# User registration
+			user_registration_max_requests=int(os.getenv('RATE_LIMIT_USER_REGISTRATION', '30')),
+			user_registration_window_hours=int(os.getenv('RATE_LIMIT_USER_REGISTRATION_WINDOW', '1')),
+
+			# Worker file upload
+			worker_upload_max_requests=int(os.getenv('RATE_LIMIT_WORKER_UPLOAD', '50000')),
+			worker_upload_window_hours=int(os.getenv('RATE_LIMIT_WORKER_UPLOAD_WINDOW', '1')),
+
+			# Debug endpoints
+			debug_max_requests=int(os.getenv('RATE_LIMIT_DEBUG', '2000')),
+			debug_window_hours=int(os.getenv('RATE_LIMIT_DEBUG_WINDOW', '1')),
+		)
+
+	def to_general_limits_dict(self) -> Dict[str, Dict[str, Any]]:
+		"""Convert to the format expected by GeneralRateLimiter."""
+		return {
+			'photo_upload': {
+				'max_requests': self.photo_upload_max_requests,
+				'window_hours': self.photo_upload_window_hours,
+				'per_user': True
+			},
+			'photo_operations': {
+				'max_requests': self.photo_ops_max_requests,
+				'window_hours': self.photo_ops_window_hours,
+				'per_user': True
+			},
+			'user_profile': {
+				'max_requests': self.user_profile_max_requests,
+				'window_hours': self.user_profile_window_hours,
+				'per_user': True
+			},
+			'general_api': {
+				'max_requests': self.general_api_max_requests,
+				'window_hours': self.general_api_window_hours,
+				'per_user': False  # Per IP
+			},
+			'public_read': {
+				'max_requests': self.public_read_max_requests,
+				'window_hours': self.public_read_window_hours,
+				'per_user': False  # Per IP
+			},
+			'activity_recent': {
+				'max_requests': self.activity_recent_max_requests,
+				'window_hours': self.activity_recent_window_hours,
+				'per_user': False  # Per IP
+			},
+			'user_registration': {
+				'max_requests': self.user_registration_max_requests,
+				'window_hours': self.user_registration_window_hours,
+				'per_user': False  # Per IP
+			},
+			'worker_upload': {
+				'max_requests': self.worker_upload_max_requests,
+				'window_hours': self.worker_upload_window_hours,
+				'per_user': False  # Per IP
+			},
+			'debug': {
+				'max_requests': self.debug_max_requests,
+				'window_hours': self.debug_window_hours,
+				'per_user': False  # Per IP
+			}
+		}
+
+	def log_configuration(self) -> None:
+		"""Log all rate limit configurations."""
+		if is_rate_limiting_disabled():
+			logger.info("RATE LIMITING IS GLOBALLY DISABLED (NO_LIMITS=true)")
+			return
+
+		logger.info("=== Rate Limit Configuration ===")
+		logger.info(f"Mapillary API: {self.mapillary_rate_limit_seconds} seconds between requests")
+		logger.info(f"Authentication: {self.auth_max_attempts} attempts per {self.auth_window_minutes} minutes, lockout: {self.auth_lockout_minutes} minutes")
+
+		logger.info("General API Rate Limits:")
+		limits_dict = self.to_general_limits_dict()
+		for limit_type, config in limits_dict.items():
+			scope = "per user" if config['per_user'] else "per IP"
+			logger.info(f"  {limit_type}: {config['max_requests']} requests per {config['window_hours']} hour(s) ({scope})")
+
+		logger.info("=== End Rate Limit Configuration ===")
+
+# Global configuration instance - now environment is loaded
+rate_limit_config = RateLimitConfig.from_env()
+

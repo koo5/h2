@@ -1,0 +1,470 @@
+import {writable, derived, get, type Writable} from 'svelte/store';
+import {
+	staggeredLocalStorageSharedStore,
+	localStorageReadOnceSharedStore,
+	localStorageSharedStore
+} from './svelte-shared-store';
+import type {PhotoData, PhotoId} from './types/photoTypes';
+import type {SimpleCoord} from './photoWorkerTypes';
+import {AngularRangeCuller, sortPhotosByBearing} from './AngularRangeCuller';
+import {normalizeBearing, getBearingColor} from './utils/bearingUtils';
+import {invoke} from "@tauri-apps/api/core";
+import {TAURI} from "$lib/tauri";
+import { overrideFilters } from '$lib/components/filters-modal/filtersStore';
+import { track } from '$lib/analytics';
+
+const doLog = false;
+;
+
+const angularRangeCuller = new AngularRangeCuller();
+
+export interface Bounds {
+	top_left: SimpleCoord;
+	bottom_right: SimpleCoord;
+}
+
+export interface SpatialState {
+	center: SimpleCoord;
+	zoom: number;
+	bounds: Bounds | null;
+	range: number;
+	source: 'gps' | 'map';
+	// Timestamp of the last intentional update (user interaction, URL params, or persisted-from-previous-session).
+	// Undefined on a true first visit — used to decide whether the featured-photo auto-navigation should kick in.
+	ts?: number;
+}
+
+export interface BearingState {
+	bearing: number;
+	source: string;
+	photoUid?: string;
+	accuracy_level?: number | null;
+	// Timestamp of the last intentional update. Undefined on a true first visit.
+	ts?: number;
+}
+
+// Bearing mode for controlling automatic bearing source
+export type BearingMode = 'car' | 'walking';
+
+// Spatial state - triggers photo filtering in worker
+export const spatialState = localStorageReadOnceSharedStore<SpatialState>('spatialState', {
+	center: {lat: 50.11692048550961, lng: 14.488374441862108},
+	zoom: 10,
+	bounds: null,
+	range: 1000,
+	source: 'map'
+});
+
+
+// Visual state - only affects rendering, optimized with debounced writes
+export const bearingState = localStorageReadOnceSharedStore<BearingState>('bearingState', {
+	bearing: 141,
+	source: 'map',
+	accuracy_level: null
+}, 500);
+
+// Bearing mode state - controls automatic bearing source (car = GPS, walking = compass)
+export const bearingMode = localStorageSharedStore<BearingMode>('bearingMode', 'walking');
+
+export const picks: Writable<Set<PhotoId>> = writable(new Set());
+
+// Photos the timeline walk wants kept loaded — pinned into `picks` so the server
+// doesn't cull them after we fly to them. Unioned with the current front photo.
+// Empty unless a timeline walk is active, so normal behaviour is unchanged.
+export const timelinePinned: Writable<Set<PhotoId>> = writable(new Set());
+
+// Gate: true after afterInit() has established real spatial state from map + URL params.
+// Prevents premature worker requests and rendering with stale localStorage values.
+export const mapReady = writable<boolean>(false);
+
+// Photos filtered by spatial criteria (from worker)
+export const photosInArea = writable<PhotoData[]>([]);
+
+// Photos in range for navigation (from worker)
+export const photosInRange = writable<PhotoData[]>([]);
+
+// Whether any photo in range is featured (excluding filtered ones)
+export const anyFeatured = writable<boolean>(false);
+
+// Whether any photo in range is filtered out by analysis filters
+export const anyFiltered = writable<boolean>(false);
+
+// Hunter mode: disables "featured grays out the rest" behavior + shows advanced UI controls
+// Persisted user preference (localStorage)
+const hunterModePref = localStorageReadOnceSharedStore<boolean>('hunterMode', false);
+// Session-only override from URL photo (null = use preference)
+const hunterModeOverride = writable<boolean | null>(null);
+// Effective hunterMode — override wins if set, otherwise falls back to preference
+export const hunterMode = derived(
+	[hunterModePref, hunterModeOverride],
+	([pref, override]) => override !== null ? override : pref
+);
+
+export function toggleHunterMode() {
+	hunterModeOverride.set(null);
+	hunterModePref.update(v => {
+		track(v ? 'hunterModeClickOff' : 'hunterModeClickOn');
+		return !v;
+	});
+}
+
+export function setHunterMode(value: boolean) {
+	hunterModeOverride.set(null);
+	hunterModePref.set(value);
+}
+
+
+// URL photo auto-hunterMode: one-shot mechanism
+// When a URL with a photo param loads, we remember the photo UID here.
+// Once the photo appears in photosInRange, we set hunterMode based on its featured status.
+let urlRequestedPhotoUid: string | null = null;
+
+export function setUrlRequestedPhoto(uid: string) {
+	urlRequestedPhotoUid = uid;
+}
+
+// Update anyFeatured/anyFiltered when photosInRange changes
+photosInRange.subscribe(photos => {
+	anyFeatured.set(photos.some(p => p.featured === true && !p.filtered));
+	anyFiltered.set(photos.some(p => p.filtered === true));
+});
+
+// Auto-set hunterMode when URL-requested photo appears in range
+photosInRange.subscribe(photos => {
+	if (!urlRequestedPhotoUid) return;
+	const photo = photos.find(p => p.uid === urlRequestedPhotoUid);
+	if (photo) {
+		const shouldBeHunterMode = !photo.featured;
+		if (get(hunterMode) !== shouldBeHunterMode) {
+			console.log(`🢄URL photo ${photo.uid}: featured=${photo.featured}, setting hunterMode override=${shouldBeHunterMode}`);
+			hunterModeOverride.set(shouldBeHunterMode);
+		}
+		urlRequestedPhotoUid = null; // one-shot
+	}
+});
+
+// Photos eligible for navigation: exclude filtered, and when featured exist exclude non-featured
+export const navigablePhotos = derived(
+	[photosInRange, anyFeatured, hunterMode, overrideFilters],
+	([photos, hasFeatured, hunter, override]) => {
+		const navigable = override ? photos : photos.filter(p => !p.filtered);
+		return (!hunter && hasFeatured) ? navigable.filter(p => p.featured) : navigable;
+	}
+);
+
+// Combined photos for rendering (includes placeholders)
+// Only recalculates when photo list changes, not on bearing changes
+export const visiblePhotos = derived(
+	[photosInArea],
+	([photos]) => {
+		const currentBearing = get(bearingState).bearing;
+		return photos.map(photo => ({
+			...photo,
+			abs_bearing_diff: calculateAbsBearingDiff(photo.bearing, currentBearing),
+			bearing_color: getBearingColor(calculateAbsBearingDiff(photo.bearing, currentBearing))
+		}));
+	}
+);
+
+// photosInRange.subscribe(photos => {
+// 	//console.log(`Spatial: photosInRange updated with ${photos.length} photos`);
+// });
+//
+// bearingState.subscribe(v => {
+// 	//console.log(`bearingState updated to ${JSON.stringify(v)}`);
+// });
+
+// Recalculate photosInRange when map moves (spatialState changes)
+let oldPhotosInRangeSpatialState: SpatialState | null = null;
+spatialState.subscribe(spatial => {
+	if (oldPhotosInRangeSpatialState &&
+		oldPhotosInRangeSpatialState.center.lat === spatial.center.lat &&
+		oldPhotosInRangeSpatialState.center.lng === spatial.center.lng &&
+		oldPhotosInRangeSpatialState.range === spatial.range) {
+		// No significant change
+		return;
+	}
+	oldPhotosInRangeSpatialState = spatial;
+
+	const photos = get(photosInArea);
+	const center = {lat: spatial.center.lat, lng: spatial.center.lng};
+	const inRange = angularRangeCuller.cullPhotosInRange(photos, center, spatial.range, 300, get(picks));
+
+	// Sort by bearing for consistent navigation order
+	sortPhotosByBearing(inRange);
+	//console.log(`🢄spatialState: photosInRange recalculated to ${inRange.length} photos within range ${spatial.range}m`);
+	photosInRange.set(inRange);
+});
+
+export const photoInFront = writable<PhotoData | null>(null);
+
+// Navigation photos (front, left, right) - derived from bearing-sorted photosInRange (within spatialState.range)
+
+/* fixme:
+we have to make photo id a part of bearingState. (First, we have to ensure cross-source unique photo ids.) (DONE)
+Then, photosInRange should already be sorted by bearing and id here, and then we can maybe make this work, where bearing takes precedence, but id is a tiebreaker.
+*/
+
+export const newPhotoInFront = derived(
+	[navigablePhotos, bearingState],
+	([photos, visual]) => {
+		if (photos.length === 0) {
+			//console.log('🢄Navigation: No photos available for photoInFront');
+			return null;
+		}
+
+		//console.log(`🢄Navigation: Calculating photoInFront from ${JSON.stringify(photos.map(p => ({uid: p.uid, bearing: p.bearing})))} with current bearing ${visual.bearing} and photoUid ${visual.photoUid}`);
+
+		// If a specific photo is selected in bearingState, and bearing matches, use that photo
+		if (visual.photoUid) {
+			const selectedPhoto = photos.find(p => p.uid === visual.photoUid);
+			if (selectedPhoto && calculateAbsBearingDiff(selectedPhoto.bearing, visual.bearing) === 0) {
+				if (doLog) console.log(`🢄Navigation: photoInFront ${selectedPhoto.uid} selected by photoUid from bearingState`);
+				return selectedPhoto;
+			}
+		}
+
+
+		// Find photo closest to current bearing (using uid as tiebreaker for stable sorting)
+		const currentBearing = visual.bearing;
+		let closestIndex = 0;
+		let smallestDiff = calculateAbsBearingDiff(photos[0].bearing, currentBearing);
+
+		for (let i = 1; i < photos.length; i++) {
+			const diff = calculateAbsBearingDiff(photos[i].bearing, currentBearing);
+			if (diff < smallestDiff || (diff === smallestDiff && photos[i].uid < photos[closestIndex].uid)) {
+				smallestDiff = diff;
+				closestIndex = i;
+			}
+		}
+
+		const p = photos[closestIndex];
+		//console.debug(`🢄Navigation: photoInFront ${p.uid} selected from ${photos.length} photos in range by bearing proximity`);
+		return p;
+	}
+);
+
+newPhotoInFront.subscribe(photo => {
+	/*console.log(`picks: newPhotoInFront...`)
+	console.log(`picks: photo: ${JSON.stringify(photo)}`);
+	console.log(`picks: photoInFront: ${JSON.stringify(get(photoInFront))}`);*/
+	if (photo?.uid != get(photoInFront)?.uid) {
+		photoInFront.set(photo);
+		if (photo) track('photoInFront', {id: photo.uid, featured: !!photo.featured});
+		const photoUid = photo?.uid;
+		if (photoUid)
+		{
+			picks.set(new Set([photoUid, ...get(timelinePinned)]));
+			//console.log(`🢄picks: set to photoInFront uid ${photoUid}`);
+		}
+	}
+});
+
+// When the timeline's pinned set changes (e.g. stepping the walk), re-apply
+// picks even if the front photo itself didn't change.
+timelinePinned.subscribe(pins => {
+	const frontUid = get(photoInFront)?.uid;
+	picks.set(new Set([...(frontUid ? [frontUid] : []), ...pins]));
+});
+
+export const photoToLeft = derived(
+	[navigablePhotos, photoInFront],
+	([photos, front]) => {
+		if (photos.length === 0) return null;
+		if (!front) return null;
+		if (photos.length === 1) return null; // Only one photo, no left/right
+		const frontIndex = photos.findIndex(p => p.uid === front.uid);
+		if (frontIndex === -1) return null; // Front photo not in range anymore
+		const leftIndex = (frontIndex - 1 + photos.length) % photos.length;
+		const bestPhoto = photos[leftIndex];
+		//console.log(`🢄Navigation: photoToLeft is ${bestPhoto ? bestPhoto.uid : 'null'}`);
+		return bestPhoto;
+	}
+);
+
+export const photoToRight = derived(
+	[navigablePhotos, photoInFront],
+	([photos, front]) => {
+		if (photos.length === 0) return null;
+		if (!front) return null;
+		if (photos.length === 1) return null; // Only one photo, no left
+		const frontIndex = photos.findIndex(p => p.uid === front.uid);
+		if (frontIndex === -1) return null; // Front photo not in range anymore
+		const rightIndex = (frontIndex + 1) % photos.length;
+		const bestPhoto = photos[rightIndex];
+		//console.log(`🢄Navigation: photoToRight is ${bestPhoto ? bestPhoto.uid : 'null'}`);
+		return bestPhoto;
+	}
+);
+
+// Find photo with bearing within 5 degrees of front bearing but more or less yaw (simulating looking down/up)
+function photoUpDownLogic(direction: 'up' | 'down') {
+	const inRange = get(navigablePhotos);
+	let winner: PhotoData | null = null;
+	const front = get(photoInFront);
+	if (!front) return null;
+
+	const frontPitch = front.pitch ?? 0;
+	const targetBearing = front.bearing;
+	const bearingThreshold = 5; // degrees
+	for (const photo of inRange) {
+		if (photo.uid === front.uid) continue;
+		const photoPitch = photo.pitch ?? 0;
+		const bearingDiff = calculateAbsBearingDiff(photo.bearing, targetBearing);
+		if (bearingDiff <= bearingThreshold) {
+			if (direction === 'up' && photoPitch > frontPitch) {
+				const winnerPitch = winner?.pitch ?? 0;
+				if (!winner || photoPitch > winnerPitch) {
+					winner = photo;
+				}
+			} else if (direction === 'down' && photoPitch < frontPitch) {
+				const winnerPitch = winner?.pitch ?? 0;
+				if (!winner || photoPitch < winnerPitch) {
+					winner = photo;
+				}
+			}
+		}
+	}
+	if (get(photoToLeft)?.uid === winner?.uid || get(photoToRight)?.uid === winner?.uid) {
+		return null;
+	}
+	return winner;
+}
+
+
+export const photoUp = derived(
+	[navigablePhotos, photoInFront],
+	([photos, front]) => {
+		if (photos.length === 0) return null;
+		if (!front) return null;
+		if (photos.length === 1) return null;
+		const frontIndex = photos.findIndex(p => p.uid === front.uid);
+		if (frontIndex === -1) return null;
+
+		return photoUpDownLogic('up');
+	}
+);
+
+
+export const photoDown = derived(
+	[navigablePhotos, photoInFront],
+	([photos, front]) => {
+		if (photos.length === 0) return null;
+		if (!front) return null;
+		if (photos.length === 1) return null;
+		const frontIndex = photos.findIndex(p => p.uid === front.uid);
+		if (frontIndex === -1) return null;
+
+		return photoUpDownLogic('down');
+	}
+);
+
+// Helper functions for bearing calculations
+function calculateAbsBearingDiff(bearing1: number, bearing2: number): number {
+	const diff = Math.abs(bearing1 - bearing2);
+	return Math.min(diff, 360 - diff);
+}
+
+
+// Tracks the in-flight transition that tells Kotlin whether GPS rows are logged
+// as foreground ("gps") or background ("gps-background"). On the ACTIVE→BACKGROUND
+// pan we must guarantee Kotlin has stopped writing foreground GPS rows BEFORE the
+// manual 'map' location is written — otherwise a late foreground GPS row could beat
+// the manual location in the external-photo "latest non-bg entry wins" pairing.
+// Every 'map' table write below awaits this, so it holds even across rapid pans.
+let pendingLoggingSwitch: Promise<void> = Promise.resolve();
+
+export function setLocationLoggingMode(mode: 'active' | 'background'): Promise<void> {
+	if (!TAURI) return pendingLoggingSwitch;
+	pendingLoggingSwitch = invoke('plugin:hillview|cmd', {command: 'set_location_logging_mode', params: {mode}})
+		.then(() => {})
+		.catch(e => { console.error('Error invoking set_location_logging_mode in Tauri:', e); });
+	return pendingLoggingSwitch;
+}
+
+// Update functions with selective reactivity
+export async function updateSpatialState(updates: Partial<SpatialState>, source: 'gps' | 'map' = 'map', setTimestamp: boolean = true) {
+	if (doLog) console.log(`Spatial: updateSpatialState called with updates ${JSON.stringify(updates)} from source ${source}, setTimestamp=${setTimestamp}`);
+	let old = get(spatialState);
+	// Compare without `ts` so dedup still works when only the timestamp would change.
+	const {ts: _oldTs, ...oldNoTs} = old;
+	const {ts: _updTs, ...updatesNoTs} = updates;
+	if (JSON.stringify(oldNoTs) === JSON.stringify({...oldNoTs, ...updatesNoTs, source})) {
+		//console.log('Spatial: No changes in spatial state, skipping update');
+		return;
+	}
+	const nextTs = setTimestamp ? Date.now() : old.ts;
+	spatialState.update(state => ({...state, ...updates, source, ts: nextTs}));
+	if (source !== 'gps' && TAURI)
+	{
+		const state = get(spatialState);
+		try
+		{
+			// Ordering guarantee: if an ACTIVE→BACKGROUND logging switch is in
+			// flight, let it land first so this manual location is the latest
+			// non-background row. Resolved (no-op) outside that transition.
+			await pendingLoggingSwitch;
+			await invoke('plugin:hillview|cmd', {command: 'update_location', params: {
+				timestamp: Date.now(),
+				latitude: state.center.lat,
+				longitude: state.center.lng,
+				source: 'map'
+			}});
+		}
+		catch (e)
+		{
+			console.error('Error invoking update_location in Tauri:', e);
+		}
+	}
+}
+
+export function updateBearing(bearing: number, source: string = 'map', photoUid?: string, accuracy_level?: number | null, setTimestamp: boolean = true) {
+	//console.log('🢄📍 updateBearing called:', bearing, source, accuracy_level);
+	bearingState.update(state => ({
+		...state,
+		bearing,
+		source,
+		photoUid,
+		accuracy_level,
+		ts: setTimestamp ? Date.now() : state.ts,
+	}));
+	if (!source.startsWith('android') && TAURI) {
+		invoke('plugin:hillview|cmd', {command: 'update_orientation', params: {
+			timestamp: Date.now(),
+			trueHeading: bearing,
+			source: source,
+			accuracyLevel: accuracy_level
+		}}).catch(err => console.error('🢄📍 Failed to update orientation:', err));
+	}
+}
+
+export function updateBearingByDiff(diff: number, source?: string, accuracy_level?: number | null) {
+	const current = get(bearingState);
+	const newBearing = normalizeBearing(current.bearing + diff);
+	updateBearing(newBearing, source ?? current.source, current.photoUid, accuracy_level ?? current.accuracy_level);
+}
+
+
+/*
+// Calculate range from map center and bounds
+export function calculateRange(center: LatLng, bounds: Bounds): number {
+	if (!bounds) return 1000;
+
+	// Calculate distance from center to edge of bounds
+	const cornerDistance = center.distanceTo(bounds.top_left);
+	const sideDistance = center.distanceTo(new LatLng(center.lat, bounds.bottom_right.lng));
+
+	return Math.max(cornerDistance, sideDistance);
+}*/
+
+// Update bounds and recalculate range
+/*export function updateBounds(bounds: Bounds) {
+	const current = get(spatialState);
+	const range = calculateRange(current.center, bounds);
+
+	updateSpatialState({
+		bounds,
+		range
+	});
+}
+*/

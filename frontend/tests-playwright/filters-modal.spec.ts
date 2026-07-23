@@ -1,0 +1,288 @@
+import { test, expect } from './fixtures';
+import { recreateTestUsers, loginAsTestUser } from './helpers/testUsers';
+import { uploadPhoto, testPhotos } from './helpers/photoUpload';
+import { ensureSourceEnabled, ensureHunterMode } from './helpers/sourceHelpers';
+
+// GPS location of the test photos
+const TEST_PHOTO_MAP_URL = '/?lat=50.1153&lon=14.4938&zoom=18';
+
+test.describe('Filters Modal', () => {
+	test.describe.configure({ mode: 'serial' });
+
+	test.beforeAll(async () => {
+		await recreateTestUsers();
+	});
+
+	test.beforeEach(async ({ page, testUsers }) => {
+		await loginAsTestUser(page, testUsers.passwords.test);
+
+		// Clear localStorage filters to start fresh
+		await page.evaluate(() => localStorage.removeItem('hillview_filters'));
+	});
+
+	test('should open and close the filters modal', async ({ page }) => {
+		await page.goto('/');
+		await page.waitForSelector('.leaflet-container', { timeout: 11*10000 });
+		await ensureHunterMode(page, true);
+
+		const filtersButton = page.locator('[data-testid="filters-button"]');
+		await expect(filtersButton).toBeVisible();
+		await filtersButton.click();
+
+		const modal = page.locator('[data-testid="filters-modal"]');
+		await expect(modal).toBeVisible();
+
+		// Close via close button
+		await modal.locator('.close-button').click();
+		await expect(modal).not.toBeVisible();
+	});
+
+	test('clear button and show-unanalyzed toggle should be disabled when no filters active', async ({ page }) => {
+		await page.goto('/');
+		await page.waitForSelector('.leaflet-container', { timeout: 11*10000 });
+		await ensureHunterMode(page, true);
+
+		await page.locator('[data-testid="filters-button"]').click();
+		const modal = page.locator('[data-testid="filters-modal"]');
+		await expect(modal).toBeVisible();
+
+		const clearButton = modal.locator('[data-testid="clear-filters"]');
+		await expect(clearButton).toBeDisabled();
+
+		const showUnanalyzed = modal.locator('[data-testid="show-unanalyzed"] input[type="checkbox"]');
+		await expect(showUnanalyzed).toBeDisabled();
+	});
+
+	test('selecting a filter should enable clear button and show-unanalyzed toggle', async ({ page }) => {
+		await page.goto('/');
+		await page.waitForSelector('.leaflet-container', { timeout: 11*10000 });
+		await ensureHunterMode(page, true);
+
+		await page.locator('[data-testid="filters-button"]').click();
+		const modal = page.locator('[data-testid="filters-modal"]');
+
+		// Click a filter chip
+		const dayFilter = modal.locator('[data-testid="filter"][data-filter-name="time_of_day"][data-filter-value="day"]');
+		await dayFilter.click();
+
+		// Chip should be selected
+		await expect(dayFilter).toHaveClass(/selected/);
+
+		// Clear and show-unanalyzed should now be enabled
+		const clearButton = modal.locator('[data-testid="clear-filters"]');
+		await expect(clearButton).toBeEnabled();
+
+		const showUnanalyzed = modal.locator('[data-testid="show-unanalyzed"] input[type="checkbox"]');
+		await expect(showUnanalyzed).toBeEnabled();
+	});
+
+	test('clicking a selected filter should deselect it (toggle behavior)', async ({ page }) => {
+		await page.goto('/');
+		await page.waitForSelector('.leaflet-container', { timeout: 11*10000 });
+		await ensureHunterMode(page, true);
+
+		await page.locator('[data-testid="filters-button"]').click();
+		const modal = page.locator('[data-testid="filters-modal"]');
+
+		const dayFilter = modal.locator('[data-testid="filter"][data-filter-name="time_of_day"][data-filter-value="day"]');
+
+		// Select
+		await dayFilter.click();
+		await expect(dayFilter).toHaveClass(/selected/);
+
+		// Deselect
+		await dayFilter.click();
+		await expect(dayFilter).not.toHaveClass(/selected/);
+
+		// Clear button should be disabled again
+		await expect(modal.locator('[data-testid="clear-filters"]')).toBeDisabled();
+	});
+
+	test('clear all filters should deselect everything', async ({ page }) => {
+		await page.goto('/');
+		await page.waitForSelector('.leaflet-container', { timeout: 11*10000 });
+		await ensureHunterMode(page, true);
+
+		await page.locator('[data-testid="filters-button"]').click();
+		const modal = page.locator('[data-testid="filters-modal"]');
+
+		// Select multiple filters
+		await modal.locator('[data-testid="filter"][data-filter-name="time_of_day"][data-filter-value="day"]').click();
+		await modal.locator('[data-testid="filter"][data-filter-name="location_type"][data-filter-value="outdoors"]').click();
+
+		// Both should be selected
+		await expect(modal.locator('[data-testid="filter"][data-filter-name="time_of_day"][data-filter-value="day"]')).toHaveClass(/selected/);
+		await expect(modal.locator('[data-testid="filter"][data-filter-name="location_type"][data-filter-value="outdoors"]')).toHaveClass(/selected/);
+
+		// Click clear
+		await modal.locator('[data-testid="clear-filters"]').click();
+
+		// No filters should be selected
+		const selectedFilters = modal.locator('[data-testid="filter"].selected');
+		await expect(selectedFilters).toHaveCount(0);
+
+		// Clear and show-unanalyzed should be disabled again
+		await expect(modal.locator('[data-testid="clear-filters"]')).toBeDisabled();
+		await expect(modal.locator('[data-testid="show-unanalyzed"] input[type="checkbox"]')).toBeDisabled();
+	});
+
+	test('filters button should show active filter count', async ({ page }) => {
+		await page.goto('/');
+		await page.waitForSelector('.leaflet-container', { timeout: 11*10000 });
+		await ensureHunterMode(page, true);
+
+		const filtersButton = page.locator('[data-testid="filters-button"]');
+
+		// Open modal and select two filters
+		await filtersButton.click();
+		const modal = page.locator('[data-testid="filters-modal"]');
+
+		await modal.locator('[data-testid="filter"][data-filter-name="time_of_day"][data-filter-value="day"]').click();
+		await modal.locator('[data-testid="filter"][data-filter-name="location_type"][data-filter-value="outdoors"]').click();
+
+		// Close modal
+		await modal.locator('.close-button').click();
+
+		// Filters button should show count
+		await expect(filtersButton).toContainText('(2)');
+	});
+
+	test('show-unanalyzed toggle should be checked by default', async ({ page }) => {
+		await page.goto('/');
+		await page.waitForSelector('.leaflet-container', { timeout: 11*10000 });
+		await ensureHunterMode(page, true);
+
+		await page.locator('[data-testid="filters-button"]').click();
+		const modal = page.locator('[data-testid="filters-modal"]');
+
+		// Activate a filter first so the toggle is enabled
+		await modal.locator('[data-testid="filter"][data-filter-name="time_of_day"][data-filter-value="day"]').click();
+
+		const showUnanalyzed = modal.locator('[data-testid="show-unanalyzed"] input[type="checkbox"]');
+		await expect(showUnanalyzed).toBeChecked();
+	});
+});
+
+test.describe('Filters with uploaded photos', () => {
+	test.describe.configure({ mode: 'serial' });
+
+	// Each test uploads photos — need per-test isolation
+	test.beforeEach(async () => {
+		await recreateTestUsers();
+	});
+
+	test('applying a filter should hide unanalyzed photos on map', async ({ page, testUsers }) => {
+
+		await loginAsTestUser(page, testUsers.passwords.test);
+		await page.evaluate(() => localStorage.removeItem('hillview_filters'));
+		await uploadPhoto(page, testPhotos[0]);
+
+		// Go to map at the test photo's GPS location
+		await page.goto(TEST_PHOTO_MAP_URL);
+		await page.waitForSelector('.leaflet-container', { timeout: 11*10000 });
+		await ensureHunterMode(page, true);
+		await ensureSourceEnabled(page, 'hillview', true);
+
+		// Check that photo markers are visible (unanalyzed photos show by default)
+		const markersBeforeFilter = page.locator('[data-testid^="photo-marker-"]');
+		await expect(markersBeforeFilter).not.toHaveCount(0, { timeout: 11*15000 });
+
+		// Open filters and select a filter
+		await page.locator('[data-testid="filters-button"]').click();
+		const modal = page.locator('[data-testid="filters-modal"]');
+		await expect(modal).toBeVisible();
+
+		// Select "Day" time filter — since photo is unanalyzed and show_unanalyzed defaults to true,
+		// it should still show
+		await modal.locator('[data-testid="filter"][data-filter-name="time_of_day"][data-filter-value="day"]').click();
+
+		// Close modal to see the map
+		await modal.locator('.close-button').click();
+
+		// Photos should still be visible (show_unanalyzed is true by default)
+		const markersWithFilter = page.locator('[data-testid^="photo-marker-"]');
+		await expect(markersWithFilter).not.toHaveCount(0, { timeout: 11*15000 });
+	});
+
+	test('disabling show-unanalyzed should hide unanalyzed photos', async ({ page, testUsers }) => {
+
+		await loginAsTestUser(page, testUsers.passwords.test);
+		await page.evaluate(() => localStorage.removeItem('hillview_filters'));
+		await uploadPhoto(page, testPhotos[0]);
+
+		// Go to map at the test photo's GPS location
+		await page.goto(TEST_PHOTO_MAP_URL);
+		await page.waitForSelector('.leaflet-container', { timeout: 11*10000 });
+		await ensureHunterMode(page, true);
+		await ensureSourceEnabled(page, 'hillview', true);
+
+		// Confirm markers exist
+		const markersBefore = page.locator('[data-testid^="photo-marker-"]');
+		await expect(markersBefore).not.toHaveCount(0, { timeout: 11*15000 });
+
+		// Open filters, select a filter, then uncheck show-unanalyzed
+		await page.locator('[data-testid="filters-button"]').click();
+		const modal = page.locator('[data-testid="filters-modal"]');
+
+		await modal.locator('[data-testid="filter"][data-filter-name="time_of_day"][data-filter-value="day"]').click();
+
+		const showUnanalyzed = modal.locator('[data-testid="show-unanalyzed"] input[type="checkbox"]');
+		await expect(showUnanalyzed).toBeChecked();
+		await showUnanalyzed.uncheck();
+		await expect(showUnanalyzed).not.toBeChecked();
+
+		// Close modal
+		await modal.locator('.close-button').click();
+
+		// All photos are unanalyzed — markers still visible but grayed
+		const markers = page.locator('[data-testid^="photo-marker-"]');
+		await expect(markers).not.toHaveCount(0, { timeout: 11*15000 });
+		const markerCount = await markers.count();
+		const grayedCircles = page.locator('[data-testid^="photo-marker-"] .bearing-circle.grayed');
+		await expect(grayedCircles).toHaveCount(markerCount, { timeout: 11*10000 });
+	});
+
+	test('re-enabling show-unanalyzed should bring photos back', async ({ page, testUsers }) => {
+
+		await loginAsTestUser(page, testUsers.passwords.test);
+		await page.evaluate(() => localStorage.removeItem('hillview_filters'));
+		await uploadPhoto(page, testPhotos[0]);
+
+		// Go to map at the test photo's GPS location
+		await page.goto(TEST_PHOTO_MAP_URL);
+		await page.waitForSelector('.leaflet-container', { timeout: 11*10000 });
+		await ensureHunterMode(page, true);
+		await ensureSourceEnabled(page, 'hillview', true);
+
+		// Wait for initial marker load before applying filters
+		await expect(page.locator('[data-testid^="photo-marker-"]')).not.toHaveCount(0, { timeout: 11*15000 });
+
+		// Open filters, select a filter, uncheck show-unanalyzed
+		await page.locator('[data-testid="filters-button"]').click();
+		const modal = page.locator('[data-testid="filters-modal"]');
+
+		await modal.locator('[data-testid="filter"][data-filter-name="time_of_day"][data-filter-value="day"]').click();
+		await modal.locator('[data-testid="show-unanalyzed"] input[type="checkbox"]').uncheck();
+
+		// Close and wait
+		await modal.locator('.close-button').click();
+
+		// Markers visible but grayed
+		const markers = page.locator('[data-testid^="photo-marker-"]');
+		await expect(markers).not.toHaveCount(0, { timeout: 11*15000 });
+		const markerCount = await markers.count();
+		const grayedCircles = page.locator('[data-testid^="photo-marker-"] .bearing-circle.grayed');
+		await expect(grayedCircles).toHaveCount(markerCount, { timeout: 11*10000 });
+
+		// Re-open and re-enable show-unanalyzed
+		await page.locator('[data-testid="filters-button"]').click();
+		await expect(modal).toBeVisible();
+		await modal.locator('[data-testid="show-unanalyzed"] input[type="checkbox"]').check();
+
+		// Close
+		await modal.locator('.close-button').click();
+
+		// Markers should no longer be grayed
+		await expect(grayedCircles).toHaveCount(0, { timeout: 11*10000 });
+	});
+});

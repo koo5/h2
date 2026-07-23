@@ -1,0 +1,227 @@
+<script lang="ts">
+	import { createEventDispatcher, onDestroy } from 'svelte';
+	import { TAURI, BROWSER } from '$lib/tauri';
+	import { navigateWithHistory } from '$lib/navigation.svelte.js';
+	import {auth} from '$lib/auth.svelte';
+	import {get} from "svelte/store";
+	import {getSettings, settings, updateSettings} from '$lib/settings';
+
+	// Event from parent when a photo was captured
+	export let photoCaptured = 0;
+
+	const dispatch = createEventDispatcher();
+
+	let autoUploadEnabled = false;
+	let autoUploadPromptEnabled = true;
+	let visible = false;
+	let dismissed = false;
+	let showTimer: ReturnType<typeof setTimeout> | null = null;
+	let hideTimer: ReturnType<typeof setTimeout> | null = null;
+
+	let photoCapturedOld = 0;
+
+	// When a photo is captured, wait a bit then check if we should show prompt
+	$: if ((photoCaptured != photoCapturedOld)) {
+		photoCapturedOld = photoCaptured;
+		schedulePromptCheck();
+	}
+
+	let authed: boolean;
+	$: authed = $auth.is_authenticated && !!$auth.user;
+
+	function schedulePromptCheck() {
+		// Clear any existing timers
+		if (showTimer) {
+			clearTimeout(showTimer);
+		}
+		if (hideTimer) {
+			clearTimeout(hideTimer);
+		}
+
+		// Wait after capture before showing prompt (avoid UI confusion)
+		showTimer = setTimeout(() => {
+			checkSettings();
+		}, 800);
+	}
+
+	async function checkSettings() {
+		const currentSettings = await getSettings();
+		console.log('AutoUploadPrompt: settings:', JSON.stringify(currentSettings), ' authed=', authed);
+		if (currentSettings) {
+			autoUploadEnabled = currentSettings.auto_upload_enabled || false;
+			autoUploadPromptEnabled = currentSettings.auto_upload_prompt_enabled ?? true;
+		}
+
+		visible = (!authed || !autoUploadEnabled) && autoUploadPromptEnabled;
+
+		// If we should show the prompt, auto-hide it after 10 seconds
+		if (visible && TAURI) { // in BROWSER, it's unlikely that people will capture photos for any other reason than to upload, so we can keep the prompt visible until they interact with it
+			hideTimer = setTimeout(() => {
+				hidePrompt();
+			}, 12000);
+		}
+	}
+
+	function goToUploadSettings() {
+		hidePrompt();
+		navigateWithHistory('/settings/upload');
+	}
+
+	function dismissPrompt() {
+		dismissed = true;
+		hidePrompt();
+	}
+
+	function hidePrompt() {
+		visible = false;
+		clearTimers();
+	}
+
+	function clearTimers() {
+		if (showTimer) {
+			clearTimeout(showTimer);
+			showTimer = null;
+		}
+		if (hideTimer) {
+			clearTimeout(hideTimer);
+			hideTimer = null;
+		}
+	}
+
+	onDestroy(() => {
+		clearTimers();
+	});
+
+	async function neverAskAgain() {
+		// Permanently disable prompting
+		try {
+			await updateSettings({
+				auto_upload_enabled: false,
+				auto_upload_prompt_enabled: false
+			});
+			autoUploadPromptEnabled = false;
+			dispatch('dismiss');
+		} catch (err) {
+			console.error('Failed to save settings:', err);
+		}
+	}
+</script>
+
+{#if visible && !dismissed && (TAURI || BROWSER) && autoUploadPromptEnabled && (!autoUploadEnabled || !authed)}
+	<div class="auto-upload-prompt" data-testid="auto-upload-prompt">
+		<div class="prompt-content">
+			<button
+				class="configure-btn"
+				on:click={goToUploadSettings}
+				data-testid="configure-auto-upload"
+			>
+				⚙️ Configure auto-upload
+			</button>
+			<button
+				class="dismiss-btn"
+				on:click={dismissPrompt}
+				data-testid="dismiss-prompt"
+				aria-label="Dismiss for now"
+				title="Dismiss for now"
+			>
+				×
+			</button>
+		</div>
+	</div>
+{/if}
+
+<style>
+	.auto-upload-prompt {
+       position: absolute;
+        top: 80px;
+        left: 1rem;
+        padding: 0.25rem;
+        border-radius: 8px;
+        max-width: 90%;
+        cursor: pointer;
+        transition: background 0.3s ease, border 0.3s ease, backdrop-filter 0.3s ease;
+		box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+		display: flex;
+		flex-direction: column;
+		animation: slideIn 0.3s ease-out;
+	}
+
+	@keyframes slideIn {
+		from {
+			opacity: 0;
+			transform: translateY(-10px);
+		}
+		to {
+			opacity: 1;
+			transform: translateY(0);
+		}
+	}
+
+	.prompt-content {
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+		padding: 0.75rem;
+	}
+
+	.configure-btn {
+		flex: 1;
+		padding: 0.75rem 1.5rem;
+		background: #d32f2f;
+		color: white;
+		border: none;
+		border-radius: 4px;
+		font-size: 1.1rem;
+		font-weight: 600;
+		cursor: pointer;
+		transition: background 0.2s;
+		white-space: nowrap;
+	}
+
+	.configure-btn:hover {
+		background: #b71c1c;
+	}
+
+	.configure-btn:active {
+		transform: scale(0.98);
+	}
+
+	.dismiss-btn {
+		width: 24px;
+		height: 24px;
+		padding: 0;
+		background: rgba(0, 0, 0, 0.1);
+		border: none;
+		border-radius: 50%;
+		cursor: pointer;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		font-size: 1.2rem;
+		line-height: 1;
+		color: #666;
+		transition: background 0.2s;
+	}
+
+	.dismiss-btn:hover {
+		background: rgba(0, 0, 0, 0.2);
+	}
+
+
+	@media (prefers-color-scheme: dark) {
+		.auto-upload-prompt {
+			background: rgba(30, 30, 30, 0.95);
+			border-color: rgba(255, 255, 255, 0.1);
+		}
+
+		.dismiss-btn {
+			background: rgba(255, 255, 255, 0.1);
+			color: #aaa;
+		}
+
+		.dismiss-btn:hover {
+			background: rgba(255, 255, 255, 0.2);
+		}
+
+	}
+</style>

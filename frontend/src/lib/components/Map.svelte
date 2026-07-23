@@ -1,0 +1,2496 @@
+<script lang="ts">
+	import {onMount, onDestroy, tick} from 'svelte';
+	import {Polygon, LeafletMap, TileLayer, Marker, Circle, ScaleControl} from 'svelte-leafletjs';
+	import {LatLng} from 'leaflet';
+	import {RotateCcw, RotateCw, ArrowLeftCircle, ArrowRightCircle, LocateFixed, Pause, ArrowUp, ArrowDown, Layers, Eye, Map as MapIcon, Info, Filter, Clock} from 'lucide-svelte';
+	import FiltersModal from './filters-modal/FiltersModal.svelte';
+	import { activeFilterCount, openFiltersModal, clearFilters } from './filters-modal/filtersStore';
+	import { longPress } from '$lib/actions/longPress';
+	import L from 'leaflet';
+import { timelineActive, timelinePhotos, timelineCurrent, toggleTimeline } from '$lib/timeline';
+	import 'leaflet/dist/leaflet.css';
+	import 'leaflet-textpath';
+	import { getCurrentProviderConfig, setTileProvider, currentTileProvider } from '$lib/tileProviders';
+	import Spinner from './Spinner.svelte';
+	import TileProviderSelector from './TileProviderSelector.svelte';
+	import CompassButton from './CompassButton.svelte';
+	import LocationButtonInner from './LocationButtonInner.svelte';
+	import { getCurrentPosition, type GeolocationPosition } from '$lib/preciseLocation';
+	import {
+		enableLocationTracking,
+		locationManager,
+		locationTrackingLoading,
+		startLocationTracking,
+		stopLocationTracking
+	} from '$lib/locationManager';
+	import BearingStateArrow from './BearingStateArrow.svelte';
+
+	import {
+		spatialState,
+		bearingMode,
+		bearingState,
+		visiblePhotos,
+		photoToLeft,
+		photoToRight,
+		photosInArea,
+		photosInRange,
+		updateSpatialState,
+		updateBearingByDiff,
+
+		updateBearing,
+		picks,
+		anyFeatured,
+		anyFiltered,
+		hunterMode,
+		toggleHunterMode,
+		setHunterMode,
+
+		mapReady,
+		setUrlRequestedPhoto,
+		setLocationLoggingMode,
+	} from "$lib/mapState";
+	import { overrideFilters } from '$lib/components/filters-modal/filtersStore';
+	import {featuredPhotoData, maybeFetchFeaturedPhoto} from "$lib/featuredPhoto";
+	import {updateBearingWithPhoto, disableBearingTracking} from "$lib/bearingTracking";
+	import {adjustMountOffset} from "$lib/gpsOrientation.svelte";
+	import {getAngularDistance} from "$lib/utils/bearingUtils";
+	import {enableSourceForPhotoUid, sources} from "$lib/data.svelte.js";
+	import { simplePhotoWorker } from '$lib/simplePhotoWorker';
+	import { turn_to_photo_to, app, sourceLoadingStatus } from "$lib/data.svelte.js";
+	import { updateGpsLocation, setLocationTracking, setLocationError, gpsLocation, locationTracking, lastKnownGpsLocation, backgroundLocationTracking, setBackgroundLocationTracking } from "$lib/location.svelte.js";
+	import { isOnMapRoute, compassEnabled, disableCompass } from "$lib/compass.svelte.js";
+	import { optimizedMarkerSystem, setupMarkerClickDelegation } from '$lib/optimizedMarkers';
+	import '$lib/styles/optimizedMarkers.css';
+	import type { PhotoData } from '$lib/types/photoTypes';
+	import PhotoMarkerIcon from './PhotoMarkerIcon.svelte';
+
+	import {get} from "svelte/store";
+	import {stringifyCircularJSON} from "$lib/utils/json";
+	import {TAURI} from "$lib/tauri";
+	import {parsePhotoUid} from "$lib/urlUtilsServer";
+	import {pendingZoomView} from '$lib/zoomView.svelte';
+	import {openExternalUrl} from "$lib/urlUtils";
+	import {lines, linesVisible} from "$lib/data.svelte.js";
+	import {bearingBetween, distanceBetween, destinationPoint} from "$lib/geo";
+	import InsetGradients from "$lib/components/InsetGradients.svelte";
+
+	const doLog = false;
+
+	export let update_url = false;
+
+	//let flying = false;
+	let programmaticMove = false; // Flag to prevent position sync conflicts
+
+	let locationApiEventFlashTimer: any = null;
+	let locationApiEventFlash = false;
+
+	// GPS orientation tracking for car mode
+	// When in car mode with compass enabled, we track GPS heading changes
+	// and apply the difference to the map bearing (not absolute positioning)
+	let lastGpsHeading: number | null = null;
+	let map: any;
+	let timelineRoute: any = null; // Leaflet polyline of the active timeline route
+	let unsubTimelineCurrent: (() => void) | null = null;
+	let unsubTimelinePhotos: (() => void) | null = null;
+	let unsubTimelineActive: (() => void) | null = null;
+	// Throttle for timeline stepping: rapid prev/next (key autorepeat, mashing the
+	// panel buttons) would select — and start loading — every intermediate photo,
+	// and the resulting storm of interrupted fly animations can leave Leaflet's
+	// panes offset against the tiles. Instead, a lone step selects instantly, and a
+	// burst selects the latest cursor photo at most once per interval, with a
+	// trailing fire so the photo the cursor rests on is always selected.
+	const TIMELINE_STEP_THROTTLE_MS = 100;
+	let timelineStepTimer: ReturnType<typeof setTimeout> | null = null;
+	let timelineStepFiredAt = 0;
+	let elMap: any;
+	const fov_circle_radius_px = 70;
+
+	// Slideshow variables
+	let slideshowActive = false;
+	let slideshowDirection: 'left' | 'right' | null = null;
+	let slideshowTimer: any = null;
+	let slideshowInterval = 5000; // 5 seconds
+	let longPressTimeout: any = null;
+	const longPressDelay = 500; // 500ms for long press detection
+
+	// Location tracking variables (now managed by preciseLocation module)
+	let userLocationMarker: any = null;
+	let accuracyCircle: any = null;
+	let wasTrackingBeforeHidden = false;
+	let orientationRestartTimer: any = null;
+
+	// Compass state is now managed by stores in compass.svelte.ts
+
+	// Optimized marker system variables
+	let currentMarkers: L.Marker[] = [];
+	let lastPhotosUpdate = 0;
+
+	// Location tracking re-enable timer
+	let locationReEnableTimer: number | null = null;
+
+
+	// Flag to track if the current map event was caused by zoom buttons
+	let isZoomButtonEvent = false;
+	let isActivityOrientationChangeEvent = false;
+	let isWindowResizeEvent = false;
+
+	let zoomButtonEventTimer: number | null = null;
+	let activityOrientationChangeTimer: number | null = null;
+	let windowResizeTimer: number | null = null;
+
+
+	// Debug bounds rectangle
+	let boundsRectangle: any = null;
+	let userHeading: number | null = null;
+	let userLocation: GeolocationPosition | null = null;
+
+	// Source buttons display mode
+	let compactSourceButtons = true;
+
+	// Attribution: reactive expand/collapse based on map container width
+	let showAttribution = false;
+	let useCompactAttribution = false;
+	let attributionControl: L.Control.Attribution | null = null;
+	let resizeObserver: ResizeObserver | null = null;
+
+	function updateCompactAttribution(width: number) {
+		useCompactAttribution = width < 468;
+	}
+
+	// Set up ResizeObserver on the map container
+	$: if (map && !resizeObserver) {
+		const container = map.getContainer();
+		resizeObserver = new ResizeObserver((entries) => {
+			updateCompactAttribution(entries[0]?.contentRect.width ?? 0);
+		});
+		resizeObserver.observe(container);
+		updateCompactAttribution(container.clientWidth);
+	}
+
+	// Reactively add/remove Leaflet's attribution control
+	$: if (map) {
+		if (useCompactAttribution && attributionControl) {
+			map.removeControl(attributionControl);
+			attributionControl = null;
+		} else if (!useCompactAttribution && !attributionControl) {
+			attributionControl = new L.Control.Attribution({ position: 'bottomleft' });
+			map.addControl(attributionControl);
+		}
+	}
+
+	// Handle clicks in attribution popup - open links externally, otherwise close
+	async function handleAttributionClick(event: Event) {
+		const link = (event.target as HTMLElement).closest('a') as HTMLAnchorElement;
+		if (link?.href) {
+			event.preventDefault();
+			await openExternalUrl(link.href);
+		} else {
+			showAttribution = false;
+		}
+	}
+
+	$: map = elMap?.getMap();
+
+	let invalidateSizeTimeout: any = null;
+
+	// Track if marker click delegation has been set up
+	let markerClickDelegationSetup = false;
+
+	// Expose map to window for testing and fix initial size
+	$: if (map && typeof window !== 'undefined') {
+		(window as any).leafletMap = map;
+
+		// Set up marker click event delegation (once)
+		if (!markerClickDelegationSetup) {
+			const container = map.getContainer();
+			if (container) {
+				setupMarkerClickDelegation(container);
+				markerClickDelegationSetup = true;
+				//console.log('🢄Map: Marker click delegation set up');
+			}
+		}
+		// console.log('🢄Map reactive: map available, current center:', JSON.stringify(map.getCenter()));
+		// console.log('🢄Map reactive: spatialState center:', JSON.stringify(get(spatialState).center));
+		// console.log('🢄Map reactive: spatialState bounds:', JSON.stringify(get(spatialState).bounds));
+
+		// Fix initial map size after the map becomes available
+		if (!invalidateSizeTimeout) {
+			invalidateSizeTimeout = setTimeout(() => {
+				// console.log('🢄Map setTimeout: before invalidateSize, map center:', JSON.stringify(map?.getCenter()));
+				// Guard against race conditions where map is destroyed before timeout fires
+				try {
+					if (map && map._loaded && map.getContainer() && map.invalidateSize) {
+						//console.log('🢄Fixing initial map size');
+						map.invalidateSize({ reset: true, animate: false });
+						//console.log('🢄Map setTimeout: after invalidateSize, map center:', JSON.stringify(map?.getCenter()));
+					}
+				} catch (e) {
+					// Map may have been destroyed or is in an inconsistent state
+					console.debug('🢄Map invalidateSize skipped:', e instanceof Error ? e.message : String(e));
+				}
+				afterInit();
+			}, 200);
+		}
+	}
+
+	async function afterInit() {
+		// console.log('🢄Map afterInit');
+		// console.log('🢄Map afterInit: current spatialState center:', JSON.stringify(get(spatialState).center));
+		// console.log('🢄Map afterInit: current map center:', JSON.stringify(map?.getCenter()));
+		await tick();
+
+		const urlParams = new URLSearchParams(window.location.search);
+		const lat = urlParams.get('lat');
+		const lon = urlParams.get('lon');
+		const zoom = urlParams.get('zoom');
+		const bearingParam = urlParams.get('bearing');
+		const photoParam = urlParams.get('photo');
+
+		// Create a fresh object - don't mutate the store's internal state
+		const oldState = get(spatialState);
+		let p = {
+			center: oldState.center,
+			zoom: oldState.zoom,
+			bounds: oldState.bounds,
+			range: oldState.range,
+			source: oldState.source
+		};
+		let positionChanged = false;
+
+		if (lat && lon) {
+			//console.log('🢄Setting position to', lat, lon, 'from URL');
+			p.center = new LatLng(parseFloat(lat), parseFloat(lon));
+			positionChanged = true;
+		}
+
+		if (zoom) {
+			//console.log('🢄Setting zoom to', zoom, 'from URL');
+			p.zoom = parseFloat(zoom);
+			positionChanged = true;
+		}
+
+		// Move the map FIRST if position changed from URL params
+		if (positionChanged && map) {
+			map.setView(p.center, p.zoom, { animate: false });
+			// Wait for the map to settle before getting bounds
+			await new Promise<void>(resolve => {
+				map.once('moveend', () => resolve());
+				// Fallback timeout in case moveend doesn't fire
+				setTimeout(resolve, 100);
+			});
+		}
+
+		// Now get bounds AFTER the map has moved
+		let bounds = map.getBounds();
+		//console.log('🢄Leaflet bounds after move:', JSON.stringify(bounds));
+		if (bounds == null || bounds.getNorthWest().lat === bounds.getSouthEast().lat || bounds.getNorthWest().lng === bounds.getSouthEast().lng) {
+			console.log('🢄leaflet bounds are invalid, using fallback')
+			bounds = new L.LatLngBounds(
+				new L.LatLng(p.center.lat - 0.0001, p.center.lng - 0.0001),
+				new L.LatLng(p.center.lat + 0.0001, p.center.lng + 0.0001)
+			);
+		}
+		p.bounds = {
+			top_left: bounds.getNorthWest(),
+			bottom_right: bounds.getSouthEast()
+		};
+		// Compute range from actual map zoom level (not stale localStorage value)
+		const centerLatLng = p.center instanceof LatLng ? p.center : new LatLng(p.center.lat, p.center.lng);
+		p.range = get_range(centerLatLng);
+
+		// Clear filters when navigating via URL so the target photo isn't filtered out
+		if (positionChanged || photoParam) {
+			clearFilters();
+		}
+
+		// Handle photo parameter and enable corresponding source
+		const photoUid = parsePhotoUid(photoParam);
+		if (photoUid) {
+			//console.log('🢄Photo parameter from URL:', photoUid);
+			enableSourceForPhotoUid(photoUid);
+			picks.set(new Set([photoUid])); // ensure culling grid keeps this photo
+			// Switch to view mode when opening a specific photo
+			app.update(a => ({...a, activity: 'view'}));
+			// Auto-set hunterMode once this photo arrives in range
+			setUrlRequestedPhoto(photoUid);
+		}
+
+		// Only stamp spatialState.ts when the user actually directed navigation (URL params).
+		// On a truly blank first visit, leave ts undefined so maybeFetchFeaturedPhoto() can steer.
+		const isUserNavigation = positionChanged || !!photoParam;
+		await updateSpatialState({...p}, 'map', isUserNavigation);
+		mapReady.set(true);
+
+		if (bearingParam) {
+			//console.log('🢄Setting bearing to', bearingParam, 'from URL');
+			const bearing = parseFloat(bearingParam);
+			updateBearing(bearing, 'url', photoUid ?? undefined);
+		}
+
+		// Read zoom view URL params — only activate if photo param is also present
+		const x1 = urlParams.get('x1');
+		const y1 = urlParams.get('y1');
+		const x2 = urlParams.get('x2');
+		const y2 = urlParams.get('y2');
+		if (x1 !== null && y1 !== null && x2 !== null && y2 !== null && photoParam) {
+			pendingZoomView.set({
+				x1: parseFloat(x1),
+				y1: parseFloat(y1),
+				x2: parseFloat(x2),
+				y2: parseFloat(y2)
+			});
+		}
+
+		setTimeout(() => {
+			update_url = true;
+		}, 100);
+	}
+
+
+	// Handle zoom button clicks to re-enable location tracking
+	function handleZoomButtonClick() {
+		console.log('🢄[LOCATION] Zoom button clicked');
+
+		// Set flag to prevent location tracking from being disabled
+		isZoomButtonEvent = true;
+
+		// Clear any existing zoom button event timer
+		if (zoomButtonEventTimer) {
+			clearTimeout(zoomButtonEventTimer);
+		}
+
+		// Reset the flag after 500ms to handle multiple map events
+		zoomButtonEventTimer = window.setTimeout(() => {
+			console.log('🢄[LOCATION] Resetting zoom button event flag');
+			isZoomButtonEvent = false;
+			zoomButtonEventTimer = null;
+		}, 500);
+
+		if (get(locationTracking)) {
+			console.log('🢄[LOCATION] Zoom button clicked while tracking - will re-enable after 200ms');
+
+			// Clear any existing timer
+			if (locationReEnableTimer) {
+				clearTimeout(locationReEnableTimer);
+			}
+
+			// Re-enable location tracking after 200ms
+			locationReEnableTimer = window.setTimeout(() => {
+				if (get(locationTracking)) {
+					console.log('🢄[LOCATION] Re-enabling location tracking after zoom');
+					enableLocationTracking();
+				}
+			}, 200);
+		}
+	}
+
+	// Set up event listeners for Leaflet zoom controls
+	function setupZoomControlListeners() {
+		if (!map) return;
+
+		// Wait a bit for the zoom controls to be added to the DOM
+		setTimeout(() => {
+			const zoomInButton = document.querySelector('.leaflet-control-zoom-in');
+			const zoomOutButton = document.querySelector('.leaflet-control-zoom-out');
+
+			if (zoomInButton) {
+				zoomInButton.addEventListener('click', handleZoomButtonClick);
+				zoomInButton.setAttribute('data-testid', 'zoom-in-btn');
+				//console.log('🢄[LOCATION] Added zoom-in button listener');
+			}
+
+			if (zoomOutButton) {
+				zoomOutButton.addEventListener('click', handleZoomButtonClick);
+				zoomOutButton.setAttribute('data-testid', 'zoom-out-btn');
+				//console.log('🢄[LOCATION] Added zoom-out button listener');
+			}
+		}, 100);
+	}
+
+	// Optimized marker management functions
+	function updateOptimizedMarkers(photos: any[]) {
+		if (!map) return;
+
+		const updateId = Date.now();
+		lastPhotosUpdate = updateId;
+
+		//console.log(`🢄Map: updateOptimizedMarkers called with ${photos.length} photos, updateId: ${updateId}`);
+
+		// Build graying context so markers are created with correct initial state
+		const spatial = get(spatialState);
+		const grayingCtx = {
+			center: spatial.center,
+			range: spatial.range,
+			anyFeatured: get(anyFeatured),
+			hunterMode: get(hunterMode),
+			overrideFilters: get(overrideFilters),
+		};
+
+		// Use the optimized marker system
+		const updatedMarkers = optimizedMarkerSystem.updateMarkers(map, photos, grayingCtx);
+		if (updatedMarkers) {
+			currentMarkers = updatedMarkers;
+			//console.log(`🢄Map: Updated ${currentMarkers.length} optimized markers`);
+		} else {
+			console.warn('🢄Map: optimizedMarkerSystem.updateMarkers returned undefined');
+		}
+	}
+
+	// Calculate how many km are "visible" based on the current zoom/center
+	function get_range(_center: LatLng) {
+		if (!map) {
+			//console.warn('🢄get_range called before map is ready');
+			return 1000; // Default 1km
+		}
+		//return 3500000;
+		try {
+			const pointC = map.latLngToContainerPoint(_center);
+			// Move 100px to the right
+			const pointR = L.point(pointC.x + fov_circle_radius_px, pointC.y);
+			const latLngR = map.containerPointToLatLng(pointR);
+			// distanceTo returns meters
+			return _center.distanceTo(latLngR);
+		} catch (e) {
+			console.warn('🢄Error calculating range:', e);
+			return 1000; // Default 1km
+		}
+	}
+
+	spatialState.subscribe((spatial) => {
+
+		//console.log(`spatialState: ${stringifyCircularJSON(spatial)}`);
+		// Check if map is fully initialized with container
+		if (!map || !map.getContainer() || !map._loaded || programmaticMove) return;
+
+		try {
+			const currentCenter = map.getCenter();
+			const currentZoom = map.getZoom();
+			if (!currentCenter || currentCenter.lat !== spatial.center.lat || currentCenter.lng !== spatial.center.lng || currentZoom !== spatial.zoom) {
+				//console.log('🢄setView', JSON.stringify(spatial.center), spatial.zoom);
+				map.setView(new LatLng(spatial.center.lat, spatial.center.lng), spatial.zoom);
+				onMapStateChange('spatialState.subscribe');
+			}
+		} catch (e) {
+			// Map not ready yet, ignore
+			//console.log('🢄Map not ready for spatialState update:', e instanceof Error ? e.message : String(e));
+		}
+	});
+
+	let seenFirstMoveEnd = false;
+
+	async function mapStateUserEvent(event: any) {
+
+		console.log(`🢄🗺Map event: ${event.type}`);
+
+		/*if (event.type == 'moveend')
+		{
+			if (!seenFirstMoveEnd)
+			{
+				seenFirstMoveEnd = true;
+				return;
+			}
+		}*/
+
+		let isDesktopBrowser = !TAURI && (window.matchMedia("(pointer: fine)").matches || window.matchMedia("(hover: hover)").matches);
+
+		if (/*(isDesktopBrowser || TAURI) && */event.type == 'moveend')
+		{
+			//return // ignore moveend in android, as those fire off even when the map is moved programmatically - there's no way to distinguish user-initiated location changes from programmatic (gps). The tradeoff is that keyboard cant be used. Mouse/touch works by triggering dragend.
+		}
+
+		//console.log('🢄🗺mapStateUserEvent:', stringifyCircularJSON(event.type));
+
+		//if (!flying)
+		if (event.type == 'dragend' || event.type == 'zoomend')
+		{
+			let _center = map.getCenter();
+			let p = get(spatialState);
+
+			if (p.center.lat != _center.lat || p.center.lng != _center.lng) {
+				//console.log('🢄p.center:', JSON.stringify(p.center), '_center:', JSON.stringify(_center));
+
+				// Only react to genuine user pans, not programmatic zoom-button moves.
+				if (!isZoomButtonEvent) {
+					// ACTIVE → BACKGROUND: a manual pan no longer turns tracking off.
+					// Keep GPS running (pulses continue, fixes keep logging as
+					// background) but stop the map following. From OFF/BACKGROUND a
+					// manual pan changes nothing about the tracking state.
+					if (get(locationTracking)) {
+						enterBackgroundTracking();
+					}
+				} else {
+					//console.log('🢄Zoom button event detected - not disabling location tracking');
+				}
+			}
+
+		}
+		await onMapStateChange('mapStateUserEvent');
+	}
+
+
+	async function onMapStateChange(reason: string) {
+		await tick();
+		if (!map) {
+			console.warn('🢄onMapStateChange called before map is ready');
+			return;
+		}
+		try {
+			let _center = map.getCenter();
+			let _zoom = map.getZoom();
+
+			const currentSpatial = get(spatialState);
+			const bounds = map.getBounds();
+			const range = get_range(_center);
+
+			// console.log(`🢄Map: currentSpatial`, JSON.stringify(currentSpatial));
+			// console.log(`🢄Map: bounds`, JSON.stringify(bounds));
+			// console.log(`🢄Map: range`, range);
+
+			// Normalize coordinates to valid lat/lng ranges
+			const normalizeLng = (lng: number) => ((lng % 360) + 540) % 360 - 180;
+			const normalizeLat = (lat: number) => Math.max(-90, Math.min(90, lat));
+
+			const topLeft = bounds.getNorthWest();
+			const bottomRight = bounds.getSouthEast();
+
+			const newSpatialState = {
+				center: new LatLng(_center.lat, _center.lng),
+				zoom: _zoom,
+				bounds: {
+					top_left: new LatLng(
+						normalizeLat(topLeft.lat),
+						normalizeLng(topLeft.lng)
+					),
+					bottom_right: new LatLng(
+						normalizeLat(bottomRight.lat),
+						normalizeLng(bottomRight.lng)
+					)
+				},
+				range: range
+			};
+
+			// Debug log to verify normalization
+			//console.log(`Map: Normalized bounds - TL: [${newSpatialState.bounds.top_left.lat.toFixed(6)}, ${newSpatialState.bounds.top_left.lng.toFixed(6)}], BR: [${newSpatialState.bounds.bottom_right.lat.toFixed(6)}, ${newSpatialState.bounds.bottom_right.lng.toFixed(6)}]`);
+
+			// bounds?.top_left is null on initial load from localStorage, which naturally triggers the update
+			if (currentSpatial.center.lat !== newSpatialState.center.lat ||
+				currentSpatial.center.lng !== newSpatialState.center.lng ||
+				currentSpatial.zoom !== newSpatialState.zoom ||
+				currentSpatial.bounds?.top_left.lat !== newSpatialState.bounds.top_left.lat ||
+				currentSpatial.bounds?.top_left.lng !== newSpatialState.bounds.top_left.lng ||
+				currentSpatial.bounds?.bottom_right.lat !== newSpatialState.bounds.bottom_right.lat ||
+				currentSpatial.bounds?.bottom_right.lng !== newSpatialState.bounds.bottom_right.lng) {
+
+				console.log('🢄onMapStateChange:', reason, 'center:', JSON.stringify(_center), 'zoom:', _zoom);
+				updateSpatialState(newSpatialState);
+
+				/*console.log('🢄Map bounds updated:', JSON.stringify({
+					nw: `${bounds.getNorthWest().lat}, ${bounds.getNorthWest().lng}`,
+					se: `${bounds.getSouthEast().lat}, ${bounds.getSouthEast().lng}`,
+					ne: `${bounds.getNorthEast().lat}, ${bounds.getNorthEast().lng}`,
+					sw: `${bounds.getSouthWest().lat}, ${bounds.getSouthWest().lng}`,
+					center: `${_center.lat}, ${_center.lng}`,
+					zoom: _zoom
+				}, null, 2));*/
+			}
+		} catch (e) {
+			console.error('🢄Error in onMapStateChange:', e);
+		}
+	}
+
+	// Handle button clicks and prevent map interaction
+	async function handleButtonClick(action: string, event: Event) {
+		event.preventDefault();
+		event.stopPropagation();
+
+		// Stop slideshow if it's active
+		if (slideshowActive) {
+			stopSlideshow();
+		}
+
+		// Disable all bearing tracking when a turn button is clicked — the
+		// user's rotation is meaningless if compass or gps orientation is
+		// about to overwrite it on the next tick.
+		if (action === 'left' || action === 'right' || action === 'rotate-ccw' || action === 'rotate-cw') {
+			disableBearingTracking();
+		}
+
+		if (action === 'left') {
+			await turn_to_photo_to('left');
+		} else if (action === 'right') {
+			await turn_to_photo_to('right');
+		} else if (action === 'rotate-ccw') {
+			updateBearingByDiff(-15);
+		} else if (action === 'rotate-cw') {
+			updateBearingByDiff(15);
+		} else if (action === 'forward') {
+			moveForward();
+		} else if (action === 'backward') {
+			moveBackward();
+		} else if (action === 'location') {
+			toggleLocationTracking();
+		}
+
+		return false;
+	}
+
+	// Start slideshow in the specified direction
+	function startSlideshow(direction: 'left' | 'right') {
+		if (slideshowActive && slideshowDirection === direction) {
+			// If already running in this direction, stop it
+			stopSlideshow();
+			return;
+		}
+
+		slideshowActive = true;
+		slideshowDirection = direction;
+
+		// Clear any existing timer
+		if (slideshowTimer) {
+			clearInterval(slideshowTimer);
+		}
+
+		// Immediately perform the first action
+		performSlideshowAction();
+
+		// Set up interval for subsequent actions
+		slideshowTimer = setInterval(performSlideshowAction, slideshowInterval);
+	}
+
+	// Stop the slideshow
+	function stopSlideshow() {
+		slideshowActive = false;
+		slideshowDirection = null;
+		if (slideshowTimer) {
+			clearInterval(slideshowTimer);
+			slideshowTimer = null;
+		}
+	}
+
+	// Perform the slideshow action based on current direction
+	async function performSlideshowAction() {
+		if (slideshowDirection === 'left' && $photoToLeft) {
+			await turn_to_photo_to('left');
+		} else if (slideshowDirection === 'right' && $photoToRight) {
+			await turn_to_photo_to('right');
+		} else {
+			// If no more photos in this direction, stop slideshow
+			stopSlideshow();
+		}
+	}
+
+	// Handle mouse down for long press detection
+	function handleMouseDown(direction: 'left' | 'right', event: MouseEvent) {
+		event.preventDefault();
+
+		// Set timeout for long press
+		longPressTimeout = setTimeout(() => {
+			startSlideshow(direction);
+		}, longPressDelay);
+	}
+
+	// Handle mouse up to cancel long press if released early
+	function handleMouseUp(event: MouseEvent) {
+		event.preventDefault();
+		if (longPressTimeout) {
+			clearTimeout(longPressTimeout);
+			longPressTimeout = null;
+		}
+	}
+
+
+	// Move in a direction relative to current bearing
+	function move(direction: string) {
+		// Ensure we have the latest map state
+		if (!map) return;
+
+		const currentBearing = get(bearingState).bearing;
+		const _center = map.getCenter();
+
+		// Use the same approach as get_range function
+		// First, convert center to container point
+		const centerPoint = map.latLngToContainerPoint(_center);
+
+		// Calculate pixel movement based on bearing
+		const pixelDistance = fov_circle_radius_px;
+
+		// Adjust bearing based on direction
+		const adjustedBearing = direction === 'backward' ? (currentBearing + 180) % 360 : currentBearing;
+
+		// Convert bearing to radians
+		const bearingRad = (adjustedBearing * Math.PI) / 180;
+
+		// Calculate pixel offset
+		const dx = pixelDistance * Math.sin(bearingRad);
+		const dy = -pixelDistance * Math.cos(bearingRad);
+
+		// Create new point in container coordinates
+		const newPoint = L.point(centerPoint.x + dx, centerPoint.y + dy);
+
+		// Convert back to lat/lng
+		const newCenter = map.containerPointToLatLng(newPoint);
+
+		console.log(`move ${direction}:`, {
+			bearing: currentBearing,
+			adjustedBearing: adjustedBearing,
+			centerPoint: centerPoint,
+			dx: dx,
+			dy: dy,
+			newPoint: newPoint,
+			oldCenter: _center,
+			newCenter: newCenter
+		});
+
+		// Set flag to prevent position sync conflicts
+		programmaticMove = true;
+
+		// Fly to new position
+		map.flyTo(newCenter, map.getZoom());
+
+		// Update the spatial state
+		updateSpatialState({
+			center: newCenter,
+			zoom: map.getZoom(),
+			bounds: null, // Will be updated by onMapStateChange
+		});
+
+		// Reset flag after the movement is complete
+		setTimeout(() => {
+			programmaticMove = false;
+		}, 1000); // Allow time for flyTo animation
+	}
+
+	// Convenience functions (exported for keyboard shortcuts)
+	export function moveForward() {
+		move('forward');
+	}
+
+	export function moveBackward() {
+		move('backward');
+	}
+
+	/**
+	 * Handle marker click - navigate to clicked photo
+	 * If photo is not in range, move the map to the photo's location first
+	 */
+	function handleMarkerClick(photo: PhotoData, source: string = 'marker_click') {
+		console.log('🢄Marker clicked:', photo.uid, 'at', photo.coord);
+
+		// Check if photo is already in photosInRange
+		const inRange = get(photosInRange);
+		const isInRange = inRange.some(p => p.uid === photo.uid);
+
+		// Clicking a featured photo returns to tourist mode;
+		// clicking a non-featured photo enables hunter mode so it stays navigable.
+		// During a timeline walk the timeline owns hunter mode (it forces it on at
+		// open) — don't flip it per-photo, or stepping onto a featured photo would
+		// drop us back to tourist mode and break the next non-featured step.
+		if (!get(timelineActive)) {
+			if (photo.featured) {
+				if (get(hunterMode)) setHunterMode(false);
+			} else {
+				if (!get(hunterMode)) setHunterMode(true);
+			}
+		}
+		if (photo.filtered && !get(overrideFilters)) {
+			overrideFilters.set(true);
+		}
+
+		if (isInRange) {
+			// Photo is in range, just update bearing to select it
+			console.log('🢄Photo in range, selecting directly');
+			updateBearingWithPhoto(photo, source);
+		} else {
+			// Photo is not in range, move map to photo location first
+			console.log('🢄Photo not in range, moving map to photo location');
+
+			// If a programmatic move is already in flight (e.g. fast timeline
+			// stepping), jump instantly instead of animating — otherwise Leaflet
+			// queues a backlog of fly animations and the map lags behind the cursor.
+			const moveInProgress = programmaticMove;
+
+			// Set flag to prevent position sync conflicts
+			programmaticMove = true;
+
+			// Move map to photo location
+			const newCenter = new LatLng(photo.coord.lat, photo.coord.lng);
+			if (moveInProgress) {
+				map.setView(newCenter, map.getZoom(), { animate: false });
+			} else {
+				// Snappy fly that scales with on-screen distance, capped at 250ms.
+				// (flyTo's `duration` option is in seconds.)
+				const px = map.latLngToContainerPoint(map.getCenter())
+					.distanceTo(map.latLngToContainerPoint(newCenter));
+				map.flyTo(newCenter, map.getZoom(), { duration: Math.min(250, px) / 1000 });
+			}
+
+			// Update spatial state
+			updateSpatialState({
+				center: newCenter,
+				zoom: map.getZoom(),
+				bounds: null,
+			});
+
+			// Update bearing to the photo (this stores photoUid so it will be selected once in range)
+			updateBearingWithPhoto(photo, source);
+
+			// Reset flag after animation
+			setTimeout(() => {
+				programmaticMove = false;
+			}, 1000);
+		}
+	}
+
+	// Draw the loaded timeline photos as a route polyline (whole-trip context).
+	// Fed straight from timeline data, decoupled from the spatial/picks pipeline.
+	function redrawTimelineRoute() {
+		if (!map) return;
+		if (timelineRoute) {
+			map.removeLayer(timelineRoute);
+			timelineRoute = null;
+		}
+		if (!get(timelineActive)) return;
+		const latlngs = get(timelinePhotos)
+			.filter((p) => p.coord)
+			.map((p) => [p.coord.lat, p.coord.lng]) as [number, number][];
+		if (latlngs.length < 2) return;
+		timelineRoute = L.polyline(latlngs, { color: '#ff6d3a', weight: 3, opacity: 0.85, interactive: false });
+		timelineRoute.addTo(map);
+	}
+
+	function toggleLocationTracking() {
+		if (get(locationTracking)) {
+			// ACTIVE → OFF
+			stopLocationTracking();
+			setLocationTracking(false);
+		} else if (get(backgroundLocationTracking)) {
+			// BACKGROUND → OFF: turn off completely. GPS is still subscribed (we
+			// kept the 'user' consumer when entering background), so release it.
+			setBackgroundLocationTracking(false);
+			stopLocationTracking();
+			setLocationLoggingMode('active'); // next session logs GPS as foreground again
+		} else {
+			// OFF → ACTIVE
+			setLocationLoggingMode('active');
+			startLocationTracking();
+			setLocationTracking(true);
+		}
+	}
+
+	// ACTIVE → BACKGROUND, triggered by a manual map pan. Deliberately does NOT
+	// call stopLocationTracking(): the GPS subscription stays up so pulses
+	// continue and fixes keep logging (now tagged background). The map stops
+	// following because locationTracking is false → handleGpsLocationUpdate
+	// early-returns. setLocationLoggingMode('background') is awaited by the
+	// subsequent manual 'map' location write in updateSpatialState, so the
+	// manual location wins the external-photo pairing's latest-non-bg lookup.
+	function enterBackgroundTracking() {
+		setLocationTracking(false);
+		setBackgroundLocationTracking(true);
+		setLocationLoggingMode('background');
+	}
+
+
+	// Handle GPS location updates only (position/coordinates)
+	async function handleGpsLocationUpdate(position: GeolocationPosition) {
+		// Run in both ACTIVE and BACKGROUND so the marker keeps moving and the
+		// button keeps flashing (pulses continue) — only OFF skips entirely.
+		if (!get(locationTracking) && !get(backgroundLocationTracking)) return;
+
+		const { latitude, longitude, accuracy } = position.coords;
+
+		// Store the location data locally
+		userLocation = position;
+
+		console.log("handleGpsLocationUpdate:", latitude, longitude, accuracy);
+		locationTrackingLoading.set(false);
+		locationApiEventFlash = true;
+		if (locationApiEventFlashTimer !== null) {
+			clearTimeout(locationApiEventFlashTimer);
+		}
+		locationApiEventFlashTimer = setTimeout(() => {
+			locationApiEventFlash = false;
+		}, 100);
+
+		// Only ACTIVE tracking moves the map to follow GPS. In BACKGROUND the map
+		// stays parked at the user's manual pan; the fix is still recorded (table +
+		// alt_location) but must not yank the view.
+		if (map && get(locationTracking)) {
+			const latLng = new L.LatLng(latitude, longitude);
+
+			updateSpatialState({
+				center: new LatLng(latitude, longitude),
+				zoom: map.getZoom(),
+				bounds: null, // Will be updated by onMapStateChange
+				range: get_range(new LatLng(latitude, longitude))
+			}, 'gps');
+		}
+	}
+
+	// Fix Android mouse wheel behavior when map is ready
+	$: if (map && /Android/i.test(navigator.userAgent)) {
+		const mapContainer = map.getContainer();
+
+		// Remove any existing wheel listeners first
+		mapContainer.removeEventListener('wheel', handleAndroidWheel, true);
+		mapContainer.removeEventListener('wheel', handleAndroidWheel, false);
+		mapContainer.removeEventListener('mousewheel', handleAndroidWheel, true);
+		mapContainer.removeEventListener('DOMMouseScroll', handleAndroidWheel, true);
+
+		// Add our custom wheel handler with capture to intercept early
+		mapContainer.addEventListener('wheel', handleAndroidWheel, {
+			passive: false,
+			capture: true
+		});
+		mapContainer.addEventListener('mousewheel', handleAndroidWheel, {
+			passive: false,
+			capture: true
+		});
+		mapContainer.addEventListener('DOMMouseScroll', handleAndroidWheel, {
+			passive: false,
+			capture: true
+		});
+
+		// Also prevent default on the parent div
+		const mapDiv = mapContainer.parentElement;
+		if (mapDiv) {
+			mapDiv.addEventListener('wheel', (e: Event) => e.preventDefault(), { passive: false });
+		}
+
+		// Disable Leaflet's built-in scroll wheel zoom since we're handling it manually
+		map.scrollWheelZoom.disable();
+	}
+
+	// Prevent drags from touch events starting near screen edges (accidental touches while holding phone)
+	const EDGE_SAFE_MARGIN = 40; // px
+	let edgeDragGuardInstalled = false;
+
+	$: if (map && !edgeDragGuardInstalled) {
+		edgeDragGuardInstalled = true;
+		const mapContainer = map.getContainer();
+
+		mapContainer.addEventListener('touchstart', (e: TouchEvent) => {
+			const touch = e.touches[0];
+			if (!touch) return;
+			const rect = mapContainer.getBoundingClientRect();
+			const inMargin =
+				touch.clientX - rect.left < EDGE_SAFE_MARGIN ||
+				rect.right - touch.clientX < EDGE_SAFE_MARGIN ||
+				touch.clientY - rect.top < EDGE_SAFE_MARGIN ||
+				rect.bottom - touch.clientY < EDGE_SAFE_MARGIN;
+
+			if (inMargin && map.dragging.enabled()) {
+				map.dragging.disable();
+				const reenable = () => {
+					map.dragging.enable();
+					mapContainer.removeEventListener('touchend', reenable);
+					mapContainer.removeEventListener('touchcancel', reenable);
+				};
+				mapContainer.addEventListener('touchend', reenable, { once: true });
+				mapContainer.addEventListener('touchcancel', reenable, { once: true });
+			}
+		}, { capture: true });
+	}
+
+	let wheelTimeout: any = null;
+	let bearingUpdateTimeout: any = null;
+
+	// Arrow drag state
+	let arrowDragging = false;
+
+	function handleArrowDragStart(e: CustomEvent<{ pointerId: number; clientX: number; clientY: number }>) {
+		arrowDragging = true;
+
+		// Disable compass tracking (same as rotate buttons)
+		if ($compassEnabled) {
+			console.log('🢄🧭 Disabling compass tracking due to arrow drag');
+			disableCompass();
+		}
+
+		// Disable map dragging during arrow drag
+		if (map) map.dragging.disable();
+
+		const container = map?.getContainer();
+		if (!container) return;
+
+		function applyBearing(cx: number, cy: number) {
+			const rect = container!.getBoundingClientRect();
+			const px = cx - rect.left;
+			const py = cy - rect.top;
+			const dx = px - centerX;
+			const dy = py - centerY;
+			const bearing = (Math.atan2(dx, -dy) * 180 / Math.PI + 360) % 360;
+			if ($bearingMode === 'car') {
+				// Translate drag into a mount-offset change so Kotlin (Tauri) /
+				// the subsequent gps-kalman diffs (browser) stay consistent.
+				adjustMountOffset(getAngularDistance($bearingState.bearing, bearing));
+			} else {
+				updateBearing(bearing, 'arrow_drag');
+			}
+		}
+
+		function onPointerMove(ev: PointerEvent) {
+			ev.preventDefault();
+			applyBearing(ev.clientX, ev.clientY);
+		}
+
+		function cleanup() {
+			arrowDragging = false;
+			container!.removeEventListener('pointermove', onPointerMove);
+			container!.removeEventListener('pointerup', cleanup);
+			container!.removeEventListener('pointercancel', cleanup);
+			if (map) map.dragging.enable();
+		}
+
+		container.addEventListener('pointermove', onPointerMove);
+		container.addEventListener('pointerup', cleanup);
+		container.addEventListener('pointercancel', cleanup);
+	}
+
+	function handleAndroidWheel(e: WheelEvent) {
+		console.log('🢄Android wheel event:', { deltaY: e.deltaY, wheelDelta: (e as any).wheelDelta, detail: e.detail });
+
+		e.preventDefault();
+		e.stopPropagation();
+		e.stopImmediatePropagation();
+
+		// Temporarily disable dragging to prevent pan
+		if (map && map.dragging.enabled()) {
+			map.dragging.disable();
+
+			// Clear any existing timeout
+			if (wheelTimeout) {
+				clearTimeout(wheelTimeout);
+			}
+
+			// Re-enable dragging after a short delay
+			wheelTimeout = setTimeout(() => {
+				if (map) {
+					map.dragging.enable();
+				}
+				wheelTimeout = null;
+			}, 100);
+		}
+
+		const delta = e.deltaY || (e as any).wheelDelta || -e.detail;
+		if (delta && map) {
+			const zoom = map.getZoom();
+			const zoomDelta = delta > 0 ? -0.5 : 0.5;
+			const newZoom = Math.max(map.getMinZoom(), Math.min(map.getMaxZoom(), zoom + zoomDelta));
+
+			console.log('🢄Zooming from', zoom, 'to', newZoom);
+
+			// Get the mouse position relative to the map
+			const containerPoint = map.mouseEventToContainerPoint(e);
+
+			// Zoom to the mouse position
+			map.setZoomAround(containerPoint, newZoom, { animate: false });
+		}
+
+		return false;
+	}
+
+	// Handle visibility changes (orientation changes, app backgrounding)
+	function handleVisibilityChange() {
+		if (document.hidden) {
+			// App is going to background or orientation change starting
+			wasTrackingBeforeHidden = get(locationTracking);
+			console.log('🢄App visibility changed to hidden, was tracking:', wasTrackingBeforeHidden);
+		} else {
+			// App is coming to foreground or orientation change completed
+			console.log('🢄App visibility changed to visible, should resume tracking:', wasTrackingBeforeHidden);
+			if (wasTrackingBeforeHidden) {
+				// Clear any existing timer
+				if (orientationRestartTimer) {
+					clearTimeout(orientationRestartTimer);
+				}
+				// Delay restart slightly to let WebView stabilize after orientation change
+				orientationRestartTimer = setTimeout(async () => {
+					if (wasTrackingBeforeHidden && !get(locationTracking)) {
+						console.log('🢄📍 Restarting location tracking after visibility change');
+						setLocationTracking(true);
+						await startLocationTracking();
+					}
+				}, 500);
+			}
+		}
+	}
+
+	// Handle page show/hide events (iOS Safari specific)
+	function handlePageShow(event: PageTransitionEvent) {
+		if (event.persisted && wasTrackingBeforeHidden && !get(locationTracking)) {
+			console.log('🢄📍 Page shown from cache, resuming location tracking');
+			setLocationTracking(true);
+			startLocationTracking();
+		}
+	}
+
+	function handlePageHide(event: PageTransitionEvent) {
+		if (event.persisted) {
+			wasTrackingBeforeHidden = get(locationTracking);
+			console.log('🢄Page hiding to cache, was tracking:', wasTrackingBeforeHidden);
+		}
+	}
+
+	// Guard so we only fly to the featured photo once per mount
+	let featuredPhotoApplied = false;
+
+	function tryApplyFeaturedPhoto() {
+		if (featuredPhotoApplied || !get(mapReady)) return;
+		const featured = get(featuredPhotoData);
+		if (!featured) return;
+		// If the user (or URL params) has already established a spatial position, don't override.
+		if (get(spatialState).ts !== undefined) return;
+
+		featuredPhotoApplied = true;
+		const newCenter = new LatLng(featured.latitude, featured.longitude);
+		console.log('🢄Featured: navigating to featured photo', featured.id, 'at', featured.latitude, featured.longitude);
+		if (map) {
+			map.flyTo(newCenter, 6, { animate: true });
+		}
+		updateSpatialState({ center: newCenter, zoom: 6 }, 'map', true);
+
+		if (get(bearingState).ts === undefined && featured.bearing != null) {
+			updateBearing(featured.bearing, 'featured');
+		}
+	}
+
+	onMount(() => {
+		console.log('🢄Map component mounted');
+
+		// Set up marker click handler
+		optimizedMarkerSystem.setOnMarkerClick(handleMarkerClick);
+
+		// Timeline walk: route the cursor photo through the same select/fly path as a
+		// marker click, and keep the route polyline in sync with the loaded window.
+		// On (re)mount the cursor is unchanged but the store still fires synchronously.
+		// If the user arrived by navigating to a specific photo (?photo=...) — e.g.
+		// clicking a photo on /activity — that photo must win, so skip this first
+		// re-assertion and let the URL selection stand (the timeline then cursor-follows
+		// it if in-window, or goes stale → refresh button if not). Genuine cursor moves
+		// after mount still drive selection.
+		let timelineFollowReady = !new URLSearchParams(window.location.search).get('photo');
+		unsubTimelineCurrent = timelineCurrent.subscribe((target) => {
+			if (!timelineFollowReady) { timelineFollowReady = true; return; }
+			if (timelineStepTimer) clearTimeout(timelineStepTimer);
+			timelineStepTimer = null;
+			if (!target || !get(timelineActive)) return;
+			// Tag the walk's own selection so the timeline's cursor-follow can ignore it
+			// (and the in-range transients the map surfaces while flying to the target).
+			const elapsed = Date.now() - timelineStepFiredAt;
+			if (elapsed >= TIMELINE_STEP_THROTTLE_MS) {
+				timelineStepFiredAt = Date.now();
+				handleMarkerClick(target, 'timeline_step');
+			} else {
+				timelineStepTimer = setTimeout(() => {
+					timelineStepTimer = null;
+					timelineStepFiredAt = Date.now();
+					if (get(timelineActive)) handleMarkerClick(target, 'timeline_step');
+				}, TIMELINE_STEP_THROTTLE_MS - elapsed);
+			}
+		});
+		unsubTimelinePhotos = timelinePhotos.subscribe(() => redrawTimelineRoute());
+		unsubTimelineActive = timelineActive.subscribe(() => redrawTimelineRoute());
+
+		// Signal that we're now on map route
+		isOnMapRoute.set(true);
+
+		// Kick off the first-visit featured-photo fetch. No-op for returning visitors.
+		maybeFetchFeaturedPhoto();
+
+		// Subscribe to both featuredPhotoData and mapReady so we handle either-arrives-first race.
+		const unsubFeatured = featuredPhotoData.subscribe(() => tryApplyFeaturedPhoto());
+		const unsubMapReadyFP = mapReady.subscribe(() => tryApplyFeaturedPhoto());
+
+		// Initialize the simplified photo worker (async)
+		(async () => {
+			try {
+				await simplePhotoWorker.initialize();
+				//console.log('🢄SimplePhotoWorker initialized successfully');
+			} catch (error) {
+				console.error('🢄Failed to initialize SimplePhotoWorker:', error);
+			}
+
+			/*await onMapStateChange('mount');
+			console.log('🢄Map component mounted - after onMapStateChange');*/
+
+			// Add zoom control after scale control for proper ordering
+			const zoomControl = new L.Control.Zoom({ position: 'topleft' });
+			map.addControl(zoomControl);
+
+			// Attribution control is added/removed reactively via useCompactAttribution
+
+			// Set up zoom control listeners
+			setupZoomControlListeners();
+
+			// Firefox fix: Force map resize after initialization
+			if (navigator.userAgent.toLowerCase().includes('firefox')) {
+				setTimeout(() => {
+					if (map && map.invalidateSize) {
+						//console.log('🢄Firefox detected - forcing map resize');
+						map.invalidateSize({ reset: true, animate: false });
+					}
+				}, 100);
+
+				// Also add a longer timeout as backup
+				setTimeout(() => {
+					if (map && map.invalidateSize) {
+						map.invalidateSize({ reset: true, animate: false });
+					}
+				}, 500);
+			}
+		})();
+
+		// Add event listeners for visibility changes
+		document.addEventListener('visibilitychange', handleVisibilityChange);
+		window.addEventListener('pageshow', handlePageShow);
+		window.addEventListener('pagehide', handlePageHide);
+
+		// Also listen for orientation changes directly
+		window.addEventListener('orientationchange', () => {
+			console.log('🢄Orientation change detected');
+			// The visibility change handler will take care of restarting
+		});
+
+		const unsubGps = gpsLocation.subscribe((position: GeolocationPosition | null) => {
+			if (position) {
+				handleGpsLocationUpdate(position);
+			}
+		});
+
+		const gpsMarkerIcon = L.divIcon({
+			html: `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#4285F4" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="2" x2="5" y1="12" y2="12"/><line x1="19" x2="22" y1="12" y2="12"/><line x1="12" x2="12" y1="2" y2="5"/><line x1="12" x2="12" y1="19" y2="22"/><circle cx="12" cy="12" r="7"/><circle cx="12" cy="12" r="3" fill="#4285F4"/></svg>`,
+			className: 'gps-location-icon',
+			iconSize: [24, 24],
+			iconAnchor: [12, 12],
+		});
+
+		const unsubLastKnown = lastKnownGpsLocation.subscribe((loc) => {
+			if (!map) return;
+			// Keep the pulsing GPS marker alive in BACKGROUND too, not just ACTIVE.
+			if (!get(locationTracking) && !get(backgroundLocationTracking)) return;
+			if (loc) {
+				const latLng = new L.LatLng(loc.lat, loc.lng);
+				if (userLocationMarker) {
+					userLocationMarker.setLatLng(latLng);
+				} else {
+					userLocationMarker = L.marker(latLng, { icon: gpsMarkerIcon, interactive: false }).addTo(map);
+				}
+			}
+		});
+
+		return () => { unsubGps(); unsubLastKnown(); unsubFeatured(); unsubMapReadyFP(); };
+	});
+
+	//import.meta.hot?.dispose(() => (map = null));
+
+	onDestroy(async () => {
+		console.log('🢄Map component destroyed');
+		resizeObserver?.disconnect();
+		resizeObserver = null;
+		if (invalidateSizeTimeout) {
+			clearTimeout(invalidateSizeTimeout);
+			invalidateSizeTimeout = null;
+		}
+		// Abort running area processes so stale results don't arrive after navigation
+		simplePhotoWorker.abortAreaProcesses();
+		// Clear cached photos and reset bounds so we fetch fresh data when map remounts
+		mapReady.set(false);
+		photosInArea.set([]);
+		spatialState.update(s => ({...s, bounds: null}));
+		// Signal that we're no longer on map route
+		isOnMapRoute.set(false);
+		// Tear down timeline route + subscriptions
+		unsubTimelineCurrent?.();
+		unsubTimelinePhotos?.();
+		unsubTimelineActive?.();
+		unsubTimelineCurrent = unsubTimelinePhotos = unsubTimelineActive = null;
+		if (timelineStepTimer) {
+			clearTimeout(timelineStepTimer);
+			timelineStepTimer = null;
+		}
+		if (timelineRoute && map) {
+			map.removeLayer(timelineRoute);
+			timelineRoute = null;
+		}
+		// Clean up location tracking if active
+		try {
+			await locationManager.releaseLocation('user');
+		} catch (error) {
+			console.debug('🢄📍 Error stopping location updates on destroy:', error);
+		}
+
+		// Clear timers
+		if (orientationRestartTimer) {
+			clearTimeout(orientationRestartTimer);
+		}
+
+		// Clean up location re-enable timer
+		if (locationReEnableTimer) {
+			clearTimeout(locationReEnableTimer);
+			locationReEnableTimer = null;
+		}
+
+		// Clean up zoom button event timer
+		if (zoomButtonEventTimer) {
+			clearTimeout(zoomButtonEventTimer);
+			zoomButtonEventTimer = null;
+		}
+
+		// Clean up zoom control event listeners
+		const zoomInButton = document.querySelector('.leaflet-control-zoom-in');
+		const zoomOutButton = document.querySelector('.leaflet-control-zoom-out');
+
+		if (zoomInButton) {
+			zoomInButton.removeEventListener('click', handleZoomButtonClick);
+		}
+		if (zoomOutButton) {
+			zoomOutButton.removeEventListener('click', handleZoomButtonClick);
+		}
+
+		// Remove event listeners
+		document.removeEventListener('visibilitychange', handleVisibilityChange);
+		window.removeEventListener('pageshow', handlePageShow);
+		window.removeEventListener('pagehide', handlePageHide);
+		window.removeEventListener('orientationchange', () => {});
+
+		// Clean up slideshow timer if active
+		if (slideshowTimer) {
+			clearInterval(slideshowTimer);
+		}
+
+		// Clean up long press timeout if active
+		if (longPressTimeout) {
+			clearTimeout(longPressTimeout);
+		}
+
+		// Clean up wheel timeout if active
+		if (wheelTimeout) {
+			clearTimeout(wheelTimeout);
+		}
+
+		// Clean up bearing update timeout
+		if (bearingUpdateTimeout) {
+			clearTimeout(bearingUpdateTimeout);
+		}
+
+		// Clean up location API event flash timer
+		if (locationApiEventFlashTimer) {
+			clearTimeout(locationApiEventFlashTimer);
+			locationApiEventFlashTimer = null;
+		}
+
+		// Clean up line layers and touch handler
+		if (lineTouchHandler && map) {
+			map.getContainer().removeEventListener('touchstart', lineTouchHandler);
+			lineTouchHandler = null;
+		}
+		if (lineLayerGroup) {
+			lineLayerGroup.clearLayers();
+			lineLayerGroup.remove();
+			lineLayerGroup = null;
+		}
+		if (lineSvgRenderer) {
+			lineSvgRenderer.remove();
+			lineSvgRenderer = null;
+		}
+		renderedLines = [];
+
+		// Clean up optimized marker system
+		optimizedMarkerSystem.destroy();
+
+		// Clean up tile pruning interval
+		/*if (tilePruneInterval) {
+			clearInterval(tilePruneInterval);
+			tilePruneInterval = null;
+		}*/
+
+		// Clean up Android wheel event listener
+		if (map && /Android/i.test(navigator.userAgent)) {
+			const mapContainer = map.getContainer();
+			mapContainer.removeEventListener('wheel', handleAndroidWheel, true);
+			mapContainer.removeEventListener('wheel', handleAndroidWheel, false);
+
+			const mapDiv = mapContainer.parentElement;
+			if (mapDiv) {
+				mapDiv.removeEventListener('wheel', (e: Event) => e.preventDefault());
+			}
+		}
+	});
+
+	function toggleSourceVisibility(sourceId: string) {
+		sources.update(sources => {
+			const source = sources.find(s => s.id === sourceId);
+			if (source) {
+				source.enabled = !source.enabled;
+			}
+			return sources;
+		});
+	}
+
+	let width: number;
+	let height: number;
+
+	// Invalidate map size when container dimensions change (e.g., split layout settling)
+	$: if (width && height && map) {
+		map.invalidateSize({ animate: false });
+	}
+
+	// For the bearing overlay arrow:
+	let centerX: number;
+	$: centerX = width / 2;
+	let centerY: number;
+	$: centerY = height / 2;
+
+	let arrowX: number;
+	let arrowY: number;
+
+	// Compute arrow endpoint by projecting the range circle edge along the
+	// current bearing onto the screen.  This accounts for Mercator distortion
+	// so the arrow always touches the circle regardless of direction.
+	$: {
+		const bearing = $bearingState.bearing;
+		const range = $spatialState.range;
+		// Use the map's live center during a drag — $spatialState.center only
+		// settles on `moveend`, which would otherwise pin the arrow tip to the
+		// pre-pan geographic spot while bearing ticks re-fire this block.
+		const center = map?._loaded ? map.getCenter() : $spatialState.center;
+		if (map && center && range) {
+			const edgeLatLng = destinationPoint(center.lat, center.lng, bearing, (range*2.6/2) / 1000);
+			const edgePx = map.latLngToContainerPoint(new LatLng(edgeLatLng.lat, edgeLatLng.lng));
+			arrowX = edgePx.x;
+			arrowY = edgePx.y;
+		} else {
+			const fallbackRad = (bearing - 90) * Math.PI / 180;
+			arrowX = centerX + Math.cos(fallbackRad) * fov_circle_radius_px;
+			arrowY = centerY + Math.sin(fallbackRad) * fov_circle_radius_px;
+		}
+	}
+
+	// Get the current provider configuration reactively
+	$: tileConfig = getCurrentProviderConfig();
+
+	// Force tile layer to update when provider changes
+	$: if ($currentTileProvider) {
+		tileConfig = getCurrentProviderConfig();
+	}
+
+	// Reactive updates for spatial changes (photos from worker include filtered placeholders)
+	$: if ($visiblePhotos && map) {
+		//console.log(`🢄Map: Reactive update triggered - updating markers with ${$visiblePhotos.length} total photos`);
+		updateOptimizedMarkers($visiblePhotos);
+	}
+
+	// Ultra-fast bearing color updates (no worker communication)
+	$: if ($bearingState && currentMarkers && currentMarkers.length > 0) {
+		if ($app.activity != 'capture')
+		{
+			optimizedMarkerSystem.scheduleColorUpdate($bearingState.bearing);
+		}
+	}
+
+	// Update grayed state when anyFeatured, anyFiltered, hunterMode, overrideFilters, spatialState, or markers change
+	$: {
+		void $anyFiltered; // track for reactivity
+		void $overrideFilters; // track for reactivity
+		void $hunterMode; // track for reactivity
+		void currentMarkers; // re-apply after marker recreation
+		if (map && currentMarkers.length > 0) {
+			optimizedMarkerSystem.updateGraying({
+				center: $spatialState.center,
+				range: $spatialState.range,
+				anyFeatured: $anyFeatured,
+				hunterMode: $hunterMode,
+				overrideFilters: $overrideFilters,
+			});
+		}
+	}
+
+	// --- Line rendering ---
+	let lineLayerGroup: L.LayerGroup | null = null;
+	let lineSvgRenderer: L.SVG | null = null;
+	// Track rendered line data for touch hit detection
+	let renderedLines: { index: number; polyline: L.Polyline; startMarker: L.Marker; endMarker: L.Marker }[] = [];
+	let lineTouchHandler: ((e: TouchEvent) => void) | null = null;
+
+	// Distance from a point to a line segment (in pixels)
+	function pointToSegmentDistPx(p: L.Point, a: L.Point, b: L.Point): number {
+		const dx = b.x - a.x, dy = b.y - a.y;
+		const lenSq = dx * dx + dy * dy;
+		if (lenSq === 0) return p.distanceTo(a);
+		const t = Math.max(0, Math.min(1, ((p.x - a.x) * dx + (p.y - a.y) * dy) / lenSq));
+		const proj = L.point(a.x + t * dx, a.y + t * dy);
+		return p.distanceTo(proj);
+	}
+
+	function renderLines(linesVal: typeof $lines, visible: boolean) {
+		// Clean up previous touch handler
+		if (lineTouchHandler && map) {
+			map.getContainer().removeEventListener('touchstart', lineTouchHandler);
+			lineTouchHandler = null;
+		}
+		renderedLines = [];
+
+		// Clear previous
+		if (lineLayerGroup) {
+			lineLayerGroup.clearLayers();
+			if (!visible || !map) {
+				lineLayerGroup.remove();
+				lineLayerGroup = null;
+				if (lineSvgRenderer) {
+					lineSvgRenderer.remove();
+					lineSvgRenderer = null;
+				}
+				return;
+			}
+		}
+		if (!visible || !map) return;
+
+		if (!lineLayerGroup) {
+			lineLayerGroup = L.layerGroup().addTo(map);
+		}
+		if (!lineSvgRenderer) {
+			lineSvgRenderer = L.svg();
+			lineSvgRenderer.addTo(map);
+		}
+
+		const endIcon = L.divIcon({ className: 'line-endpoint', iconSize: [14, 14], iconAnchor: [7, 7] });
+		const startIcon = L.divIcon({ className: 'line-startpoint', iconSize: [14, 14], iconAnchor: [7, 7] });
+
+		function startRotationDrag(
+			lineData: typeof renderedLines[0],
+			line: typeof linesVal[0],
+			clientX: number, clientY: number
+		) {
+			const origDist = distanceBetween(line.start.lat, line.start.lng, line.end.lat, line.end.lng);
+			if (origDist === 0) return;
+
+			map!.dragging.disable();
+			const container = map!.getContainer();
+
+			function applyRotation(cx: number, cy: number) {
+				const rect = container.getBoundingClientRect();
+				const point = L.point(cx - rect.left, cy - rect.top);
+				const cursor = map!.containerPointToLatLng(point);
+				const newBearing = bearingBetween(line.start.lat, line.start.lng, cursor.lat, cursor.lng);
+				const newEnd = destinationPoint(line.start.lat, line.start.lng, newBearing, origDist);
+				lineData.polyline.setLatLngs([[line.start.lat, line.start.lng], [newEnd.lat, newEnd.lng]]);
+				lineData.endMarker.setLatLng([newEnd.lat, newEnd.lng]);
+			}
+
+			function onMouseMove(me: MouseEvent) { applyRotation(me.clientX, me.clientY); }
+			function onTouchMove(te: TouchEvent) {
+				te.preventDefault();
+				applyRotation(te.touches[0].clientX, te.touches[0].clientY);
+			}
+
+			function cleanup() {
+				container.removeEventListener('mousemove', onMouseMove);
+				container.removeEventListener('mouseup', cleanup);
+				container.removeEventListener('touchmove', onTouchMove);
+				container.removeEventListener('touchend', cleanup);
+				container.removeEventListener('touchcancel', cleanup);
+				map!.dragging.enable();
+				const latlngs = lineData.polyline.getLatLngs() as L.LatLng[];
+				const finalEnd = latlngs[1];
+				lines.update(l => l.map((ln, idx) => idx === lineData.index
+					? { ...ln, end: { lat: finalEnd.lat, lng: finalEnd.lng } } : ln));
+			}
+
+			container.addEventListener('mousemove', onMouseMove);
+			container.addEventListener('mouseup', cleanup);
+			container.addEventListener('touchmove', onTouchMove, { passive: false });
+			container.addEventListener('touchend', cleanup);
+			container.addEventListener('touchcancel', cleanup);
+		}
+
+		linesVal.forEach((line, i) => {
+			if (!line.visible) return;
+
+			const polyline = L.polyline(
+				[[line.start.lat, line.start.lng], [line.end.lat, line.end.lng]],
+				{ color: '#4a90e2', weight: 4, interactive: true, renderer: lineSvgRenderer! }
+			);
+			lineLayerGroup!.addLayer(polyline);
+
+			// Add text label along the line
+			if (line.label) {
+				(polyline as any).setText(line.label, {
+					center: true,
+					offset: -5,
+					attributes: {
+						'font-size': '13px',
+						fill: '#000000',
+						'font-family': 'sans-serif',
+						'paint-order': 'stroke',
+						stroke: '#ffffff',
+						'stroke-width': '3px',
+						'stroke-linecap': 'round',
+						'stroke-linejoin': 'round',
+					}
+				});
+			}
+
+			// Start marker (draggable)
+			const startMarker = L.marker([line.start.lat, line.start.lng], { draggable: true, icon: startIcon });
+			startMarker.on('drag', (e: any) => {
+				const pos = e.target.getLatLng();
+				polyline.setLatLngs([[pos.lat, pos.lng], [line.end.lat, line.end.lng]]);
+			});
+			startMarker.on('dragend', (e: any) => {
+				const pos = e.target.getLatLng();
+				lines.update(l => l.map((ln, idx) => idx === i ? { ...ln, start: { lat: pos.lat, lng: pos.lng } } : ln));
+			});
+			lineLayerGroup!.addLayer(startMarker);
+
+			// End marker (draggable)
+			const endMarker = L.marker([line.end.lat, line.end.lng], { draggable: true, icon: endIcon });
+			endMarker.on('drag', (e: any) => {
+				const pos = e.target.getLatLng();
+				polyline.setLatLngs([[line.start.lat, line.start.lng], [pos.lat, pos.lng]]);
+			});
+			endMarker.on('dragend', (e: any) => {
+				const pos = e.target.getLatLng();
+				lines.update(l => l.map((ln, idx) => idx === i ? { ...ln, end: { lat: pos.lat, lng: pos.lng } } : ln));
+			});
+			lineLayerGroup!.addLayer(endMarker);
+
+			const lineData = { index: i, polyline, startMarker, endMarker };
+			renderedLines.push(lineData);
+
+			// Mouse drag on polyline (works with Canvas renderer for mouse)
+			polyline.on('mousedown', (e: any) => {
+				if (arrowDragging) return;
+				L.DomEvent.stopPropagation(e);
+				startRotationDrag(lineData, line, e.originalEvent.clientX, e.originalEvent.clientY);
+			});
+		});
+
+		// Touch handler on map container — find nearest line within threshold
+		const TOUCH_THRESHOLD_PX = 15;
+		lineTouchHandler = (e: TouchEvent) => {
+			if (!map || renderedLines.length === 0 || arrowDragging) return;
+			const touch = e.touches[0];
+			const rect = map.getContainer().getBoundingClientRect();
+			const touchPt = L.point(touch.clientX - rect.left, touch.clientY - rect.top);
+
+			let bestDist = Infinity;
+			let bestEntry: typeof renderedLines[0] | null = null;
+
+			for (const entry of renderedLines) {
+				const latlngs = entry.polyline.getLatLngs() as L.LatLng[];
+				const aPx = map.latLngToContainerPoint(latlngs[0]);
+				const bPx = map.latLngToContainerPoint(latlngs[1]);
+				const dist = pointToSegmentDistPx(touchPt, aPx, bPx);
+				if (dist < bestDist) {
+					bestDist = dist;
+					bestEntry = entry;
+				}
+			}
+
+			if (bestEntry && bestDist <= TOUCH_THRESHOLD_PX) {
+				e.preventDefault();
+				e.stopPropagation();
+				const currentLines = get(lines);
+				startRotationDrag(bestEntry, currentLines[bestEntry.index], touch.clientX, touch.clientY);
+			}
+		};
+		map.getContainer().addEventListener('touchstart', lineTouchHandler, { passive: false });
+	}
+
+	$: if (map) renderLines($lines, $linesVisible);
+
+</script>
+
+
+<!-- The map container -->
+<div bind:clientHeight={height} bind:clientWidth={width} class="map" data-testid="map-container">
+	<LeafletMap
+			bind:this={elMap}
+			events={
+				{
+					//movestart: (e) => { console.log('🗺movestart', stringifyCircularJSON(e)) },
+					//dragstart: (e) => { console.log('🗺dragstart', stringifyCircularJSON(e)) },
+					moveend: mapStateUserEvent,
+					zoomend: mapStateUserEvent,
+					dragend: mapStateUserEvent,
+					dragstart: (e) => { if (get(locationTracking)) enterBackgroundTracking(); },
+				}
+				}
+			options={{
+				attributionControl: false, // We'll add it manually with correct position
+				center: [$spatialState.center.lat, $spatialState.center.lng],
+				zoom: $spatialState.zoom,
+				minZoom: 3,
+				maxZoom: 23,
+				// @ts-ignore - maxNativeZoom is a valid Leaflet option
+				maxNativeZoom: 19,
+				zoomControl: false, // We'll add it manually in the right order
+				scrollWheelZoom: !/Android/i.test(navigator.userAgent), // Disable on Android, we'll handle it manually
+				touchZoom: true,
+				dragging: true,
+				bounceAtZoomLimits: true,
+				// Memory optimization settings
+				preferCanvas: true, // Use Canvas renderer for better performance
+				maxBoundsViscosity: 1.0, // Prevent excessive panning
+				worldCopyJump: true // Wrap map around edges when panning
+			}}
+	>
+
+		<ScaleControl options={{maxWidth: 100, imperial: false}} position="topleft"/>
+
+		<!-- Base map tiles
+		 -->
+
+		{#key $currentTileProvider}
+		<TileLayer
+				options={{
+					attribution: tileConfig.attribution, // Attribution goes in options
+					maxZoom: tileConfig.maxZoom,
+					maxNativeZoom: tileConfig.maxNativeZoom,
+					minZoom: tileConfig.minZoom || 3,
+					// Memory optimization for tiles
+					//keepBuffer: 1, // Keep fewer tiles in memory (default is 2)
+					//updateWhenIdle: false, // Update tiles only when panning ends
+					//updateWhenZooming: false, // Don't update during zoom animation
+					tileSize: tileConfig.tileSize || 256, // Standard tile size
+					zoomOffset: tileConfig.zoomOffset || 0,
+					detectRetina: tileConfig.detectRetina !== undefined ? tileConfig.detectRetina : false,
+					crossOrigin: tileConfig.crossOrigin !== undefined ? tileConfig.crossOrigin : true,
+					// Additional performance options
+					updateInterval: 100, // Throttle tile updates
+					tms: tileConfig.tms || false,
+					noWrap: tileConfig.noWrap !== undefined ? tileConfig.noWrap : false,
+					zoomReverse: tileConfig.zoomReverse || false,
+					opacity: tileConfig.opacity !== undefined ? tileConfig.opacity : 1,
+					zIndex: tileConfig.zIndex || 1,
+					bounds: tileConfig.bounds, // Respect provider bounds if specified
+					className: 'map-tiles'
+				}}
+				url={tileConfig.url}
+		/>
+		{/key}
+
+
+		{#if ($app.activity != 'capture') && $spatialState.center && $mapReady}
+			<Circle
+					latLng={$spatialState.center}
+					radius={$spatialState.range}
+					color="#4AE092"
+					fillColor="#ffffff"
+					weight={8.8}
+					dashArray={[5, 15]}
+			/>
+			<!-- arrow -->
+		{/if}
+
+		<div class="svg-overlay">
+
+			<BearingStateArrow
+				{width}
+				{height}
+				{centerX}
+				{centerY}
+				{arrowX}
+				{arrowY}
+				bearingDeg={Math.round($bearingState.bearing ?? 0)}
+				on:arrowdragstart={handleArrowDragStart}
+			/>
+
+		</div>
+
+
+<!--     Debug bounds rectangle-->
+<!--    {#if $spatialState.bounds}-->
+<!--        <Polygon-->
+<!--                latLngs={[-->
+<!--                    [$spatialState.bounds.top_left.lat, $spatialState.bounds.top_left.lng],-->
+<!--                    [$spatialState.bounds.top_left.lat, $spatialState.bounds.bottom_right.lng],-->
+<!--                    [$spatialState.bounds.bottom_right.lat, $spatialState.bounds.bottom_right.lng],-->
+<!--                    [$spatialState.bounds.bottom_right.lat, $spatialState.bounds.top_left.lng]-->
+<!--                ]}-->
+<!--                color="#FF0000"-->
+<!--                fillColor="#FF0000"-->
+<!--                fillOpacity={0}-->
+<!--                weight={6}-->
+<!--                dashArray="5, 10"-->
+<!--            />-->
+<!--    {/if}-->
+
+
+	</LeafletMap>
+
+<FiltersModal />
+
+<!-- Hunter controls grid: toggle at bottom-right corner, panels extend up and left -->
+<div class="hunter-controls">
+	<div class="hunter-panel-right" class:visible={$hunterMode}>
+		<div class="source-buttons-group">
+			{#each $sources as source}
+				<button
+						class="source-button {source.enabled ? 'active' : ''}"
+						on:click={() => toggleSourceVisibility(source.id)}
+						title={`Toggle ${source.name} photos`}
+						data-testid={`source-toggle-${source.id}`}
+				>
+<!--					<div class="source-icon-wrapper">-->
+<!--						<Spinner show={source.enabled && ($sourceLoadingStatus[source.id]?.is_loading || false)} color="#fff"></Spinner>-->
+<!--						<div class="source-icon" style="background-color: {source.color}"></div>-->
+<!--					</div>-->
+					<span class="source-label">{source.name}</span>
+					{#if source.enabled && ($sourceLoadingStatus[source.id]?.is_loading || false)}
+						<div class="source-spinner"></div>
+					{/if}
+				</button>
+			{/each}
+		</div>
+	</div>
+	<div class="hunter-panel-bottom" class:visible={$hunterMode}>
+<!--		<button-->
+<!--			class="filters-button"-->
+<!--			class:active={$showAll}-->
+<!--			class:grayed={!$anyFeatured && !$anyFiltered}-->
+<!--			on:click={() => showAll.update(v => !v)}-->
+<!--			data-testid="show-all-button"-->
+<!--		>-->
+<!--			<span class="show-all-marker-icon" class:grayed={!$showAll}>-->
+<!--				<PhotoMarkerIcon bearing={0} />-->
+<!--			</span>-->
+<!--			<span class="filters-button-text">{($showAll ? 'All' : 'Top')}</span>-->
+<!--		</button>-->
+		<button
+			class="filters-button"
+			class:active={$activeFilterCount > 0}
+			use:longPress={{ onShortPress: () => openFiltersModal(), onLongPress: () => overrideFilters.update(v => !v) }}
+			title={$overrideFilters ? "Filters overridden (long-press to restore)" : "Filters (long-press to override)"}
+			data-testid="filters-button"
+		>
+			<span class="filters-button-icon" class:overridden={$overrideFilters}>
+				<Filter size={18} />
+			</span>
+			<span class="filters-button-text" class:overridden={$overrideFilters}>Filters ({$activeFilterCount})</span>
+		</button>
+		<div class="hunter-panel-separator"></div>
+		<TileProviderSelector />
+		<div class="hunter-panel-separator"></div>
+		<button
+			class="filters-button"
+			class:active={$timelineActive}
+			on:click={toggleTimeline}
+			title="Timeline — walk photos by capture time ('t')"
+			aria-label="Toggle timeline"
+			data-testid="timeline-toggle"
+		>
+			<span class="filters-button-icon"><Clock size={18} /></span>
+			<span class="filters-button-text">Timeline</span>
+		</button>
+	</div>
+	<button
+		class="hunter-mode-toggle"
+		class:active={$hunterMode}
+		on:click={toggleHunterMode}
+		title={$hunterMode ? "Hide advanced controls" : "Show advanced controls"}
+		data-testid="hunter-mode-toggle"
+	>
+		<div class="hunter-toggle-content">
+			<svg class="hunter-toggle-caret caret-up" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+				{#if $hunterMode}<polyline points="6 9 12 15 18 9" />{:else}<polyline points="18 15 12 9 6 15" />{/if}
+			</svg>
+			<!-- lucide bow-arrow icon (added in 0.499.0, inlined since we have 0.476.0) -->
+			<svg class="hunter-toggle-bow" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+				<path d="M17 3h4v4" />
+				<path d="M18.575 11.082a13 13 0 0 1 1.048 9.027 1.17 1.17 0 0 1-1.914.597L14 17" />
+				<path d="M7 10 3.29 6.29a1.17 1.17 0 0 1 .6-1.91 13 13 0 0 1 9.03 1.05" />
+				<path d="M7 14a1.7 1.7 0 0 0-1.207.5l-2.646 2.646A.5.5 0 0 0 3.5 18H5a1 1 0 0 1 1 1v1.5a.5.5 0 0 0 .854.354L9.5 18.207A1.7 1.7 0 0 0 10 17v-2a1 1 0 0 0-1-1z" />
+				<path d="M9.707 14.293 21 3" />
+			</svg>
+			<svg class="hunter-toggle-caret caret-left" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+				{#if $hunterMode}<polyline points="9 6 15 12 9 18" />{:else}<polyline points="15 18 9 12 15 6" />{/if}
+			</svg>
+		</div>
+	</button>
+</div>
+
+{#if useCompactAttribution}
+	<button
+		class="attribution-info-button"
+		on:click={() => showAttribution = !showAttribution}
+		title="Map attribution"
+	>
+		<Info size={18} />
+	</button>
+	{#if showAttribution}
+		<div
+			class="attribution-popup"
+			role="dialog"
+			aria-label="Map attribution"
+			tabindex="-1"
+			on:click={handleAttributionClick}
+			on:keydown={(e) => e.key === 'Escape' && (showAttribution = false)}
+		>
+			<!-- SECURITY: @html is safe here - attribution comes from hardcoded strings in tileProviders.ts, not user input -->
+			{@html tileConfig.attribution || '© OpenStreetMap contributors'}
+		</div>
+	{/if}
+{/if}
+
+<div class="bottom-gesture-guard"></div>
+</div>
+
+<!-- Debug bounds info -->
+<!--{#if $app.debug > 0 && $spatialState.bounds}-->
+<!--    <div class="debug-bounds-info">-->
+<!--        <div>Bounds:</div>-->
+<!--        <div>NW: {$spatialState.bounds.top_left.lat.toFixed(6)}, {$spatialState.bounds.top_left.lng.toFixed(6)}</div>-->
+<!--        <div>SE: {$spatialState.bounds.bottom_right.lat.toFixed(6)}, {$spatialState.bounds.bottom_right.lng.toFixed(6)}</div>-->
+<!--        <div>Width: {($spatialState.bounds.bottom_right.lng - $spatialState.bounds.top_left.lng).toFixed(6)}°</div>-->
+<!--        <div>Height: {($spatialState.bounds.top_left.lat - $spatialState.bounds.bottom_right.lat).toFixed(6)}°</div>-->
+<!--    </div>-->
+<!--{/if}-->
+
+<!-- Right panel moved into .hunter-controls grid -->
+
+<!-- Location/bearing tracking buttons -->
+<div class="location-button-container">
+	<button
+		class={$locationTracking ? 'active' : ''}
+		on:click={(e) => handleButtonClick('location', e)}
+		title="Track my location"
+		data-testid="track-location-btn"
+		class:flash={locationApiEventFlash}
+		class:background={$backgroundLocationTracking}
+	>
+		<LocationButtonInner />
+	</button>
+	<CompassButton />
+</div>
+
+<style>
+
+	.map {
+		width: 100%;
+		height: 100%;
+		position: relative;
+		container-type: inline-size;
+	}
+
+	.bottom-gesture-guard {
+		position: absolute;
+		bottom: 0;
+		left: 0;
+		right: 0;
+		height: var(--safe-area-inset-bottom, 0px);
+		z-index: 29999;
+		touch-action: none;
+	}
+
+	/* Hunter controls grid container */
+	.hunter-controls {
+		position: absolute;
+		bottom: calc(4px + var(--safe-area-inset-bottom, 0px));
+		right: calc(6px + var(--safe-area-inset-right, 0px));
+		z-index: 30000;
+		display: grid;
+		grid-template-areas:
+			".            right-panel"
+			"bottom-panel toggle";
+		grid-template-columns: auto auto;
+		grid-template-rows: auto auto;
+		gap: 0;
+		pointer-events: none;
+	}
+
+	/* Hunter mode toggle button */
+	.hunter-mode-toggle {
+		grid-area: toggle;
+		pointer-events: auto;
+		cursor: pointer;
+		background-color: rgba(255, 255, 255, 0.7);
+		border: 1px solid #ccc;
+		border-radius: 0.25rem;
+		padding: 0.5rem;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		transition: all 0.2s;
+		box-shadow: 0 2px 5px rgba(0, 0, 0, 0.2);
+		opacity: 0.6;
+	}
+
+	.hunter-mode-toggle,
+	.location-button-container button,
+	.source-buttons-group button,
+	.filters-button,
+	.attribution-info-button {
+		-webkit-user-select: none;
+		user-select: none;
+	}
+
+	.hunter-mode-toggle:hover {
+		background-color: rgba(255, 255, 255, 0.9);
+		opacity: 1;
+	}
+
+	.hunter-mode-toggle.active {
+		background-color: rgba(255, 255, 255, 0.7);
+		backdrop-filter: blur(4px);
+		color: #4285F4;
+		border-color: rgba(0, 0, 0, 0.1);
+		border-radius: 0 0 0.5rem 0;
+		opacity: 1;
+		box-shadow: none;
+	}
+
+	.hunter-toggle-content {
+		display: grid;
+		grid-template-areas:
+			". caret-up"
+			"caret-left bow";
+		grid-template-columns: auto auto;
+		grid-template-rows: auto auto;
+		align-items: center;
+		justify-items: center;
+		gap: 0;
+		line-height: 0;
+	}
+
+	.caret-up {
+		grid-area: caret-up;
+	}
+
+	.caret-left {
+		grid-area: caret-left;
+	}
+
+	.hunter-toggle-bow {
+		grid-area: bow;
+	}
+
+	/* Hunter panels - shared styles */
+	.hunter-panel-right,
+	.hunter-panel-bottom {
+		background-color: rgba(255, 255, 255, 0.7);
+		backdrop-filter: blur(4px);
+		padding: 4px;
+		pointer-events: none;
+		opacity: 0;
+		transition: opacity 0.3s ease;
+	}
+
+	.hunter-panel-right.visible,
+	.hunter-panel-bottom.visible {
+		pointer-events: auto;
+		opacity: 1;
+	}
+
+	/* Right panel */
+	.hunter-panel-right {
+		grid-area: right-panel;
+		border-radius: 0.5rem 0.5rem 0 0;
+		display: flex;
+		flex-direction: column;
+		gap: 4px;
+		z-index: 30000;
+		max-height: calc(100vh - 120px);
+		overflow: hidden;
+	}
+
+	/* Bottom panel */
+	.hunter-panel-bottom {
+		grid-area: bottom-panel;
+		border-radius: 0.5rem 0 0 0.5rem;
+		display: flex;
+		flex-direction: row;
+		align-items: stretch;
+		gap: 4px;
+		z-index: 30001;
+	}
+
+	.hunter-panel-separator {
+		width: 1px;
+		align-self: center;
+		height: 24px;
+		background-color: rgba(0, 0, 0, 0.15);
+		flex-shrink: 0;
+	}
+
+/*	.buttons {
+		display: flex;
+		gap: 0.5rem;
+		pointer-events: auto;
+	}
+
+	.buttons button {
+		cursor: pointer;
+		background-color: rgba(255, 255, 255, 0.5) !important;
+		border: 1px solid #ccc;
+		border-radius: 0.25rem;
+		padding: 0.5rem;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		transition: background-color 0.2s;
+	}
+
+	.buttons button:hover {
+		background-color: #f0f0f0;
+	}
+
+	.buttons button:active {
+		background-color: #e0e0e0;
+	}
+
+    .buttons button.slideshow-active {
+		background-color: #4285F4;
+		color: white;
+		border-color: #3367d6;
+		animation: pulse 2s infinite;
+	}
+	@keyframes pulse {
+		0% {
+			box-shadow: 0 0 0 0 rgba(66, 133, 244, 0.7);
+		}
+		70% {
+			box-shadow: 0 0 0 10px rgba(66, 133, 244, 0);
+		}
+		100% {
+			box-shadow: 0 0 0 0 rgba(66, 133, 244, 0);
+		}
+	}
+*/
+
+	.location-button-container {
+		position: absolute;
+		top: 16px;
+		right: 54px;
+		z-index: 30000;
+		display: flex;
+		gap: 8px;
+	}
+
+	@media (orientation: landscape) {
+		.location-button-container {
+			top: calc(6px + var(--safe-area-inset-top, 0px));
+		}
+	}
+
+
+	.location-button-container button {
+		cursor: pointer;
+		background-color: white;
+		border: 1px solid #ccc;
+		border-radius: 0.25rem;
+		padding: 0.5rem;
+		min-width: 60px;
+		min-height: 44px;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		transition: background-color 0.1s, border-color 0.1s, color 0.1s;
+		box-shadow: 0 2px 5px rgba(0, 0, 0, 0.2);
+	}
+
+	.location-button-container button:hover {
+		background-color: #f0f0f0;
+	}
+
+	.location-button-container button.active {
+		background-color: #4285F4;
+		color: white;
+		border-color: #3367d6;
+	}
+
+	/* Background tracking: GPS still on (and still flashing on each fix) but the
+	   map no longer follows — shown as a "half-blue" fill. */
+	.location-button-container button.background {
+		background-color: rgba(66, 133, 244, 0.5);
+		color: white;
+		border-color: #3367d6;
+	}
+
+	.location-button-container button.flash {
+		color: #34d399;
+	}
+
+	.location-button-container button:disabled {
+		opacity: 0.5;
+		cursor: not-allowed;
+	}
+
+	.location-button-container button:disabled:hover {
+		background-color: white;
+	}
+
+
+	.source-buttons-group {
+		display: flex;
+		flex-direction: column;
+		gap: 2px;
+		margin: 0;
+		padding: 0;
+		overflow: hidden;
+	}
+
+	.source-buttons-group button {
+		cursor: pointer;
+		background-color: white;
+		border: 1px solid #ccc;
+		border-radius: 0.25rem;
+		padding: 0.3rem 0.2rem;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		transition: all 0.2s;
+		box-shadow: 0 1px 3px rgba(0, 0, 0, 0.15);
+		min-height: 0;
+		position: relative;
+	}
+
+	.source-spinner {
+		position: absolute;
+		top: 50%;
+		left: 50%;
+		margin-top: -15px;
+		margin-left: -15px;
+		width: 30px;
+		height: 30px;
+		border-radius: 50%;
+		border: 2px solid rgba(255, 255, 255, 0.3);
+		border-top-color: #fff;
+		animation: source-spin 0.8s linear infinite;
+	}
+
+	@keyframes source-spin {
+		to { transform: rotate(1turn); }
+	}
+
+	.source-buttons-group button:hover {
+		background-color: #f0f0f0;
+	}
+
+	.source-buttons-group button.active {
+		background-color: #4285F4;
+		color: white;
+		border-color: #3367d6;
+	}
+
+	.source-label {
+		writing-mode: vertical-rl;
+		text-orientation: mixed;
+		font-size: 1rem;
+		font-weight: 500;
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		max-height: 100%;
+	}
+
+	.svg-overlay {
+		position: absolute;
+		top: 0;
+		left: 0;
+		z-index: 750;
+		pointer-events: none;
+	}
+
+	.location-button-container button:not(.active) {
+		opacity: 0.6;
+	}
+
+	/* Align scale and zoom controls flush */
+	:global(.leaflet-control-scale) {
+		margin-bottom: 0 !important;
+	}
+
+	:global(.leaflet-control-zoom) {
+		background-color: rgba(255, 255, 255, 0.5) !important;
+		margin-top: 0 !important;
+	}
+
+	:global(.leaflet-control-zoom a) {
+		width: 44px !important;
+		height: 44px !important;
+		line-height: 44px !important;
+		font-size: 24px !important;
+		background-color: rgba(255, 255, 255, 0.7) !important;
+	}
+
+	/* Portrait: map is bottom, offset from divider on top */
+	@media (orientation: portrait) {
+		:global(.leaflet-control-scale) {
+			margin-top: 16px !important;
+		}
+	}
+
+	/* Landscape: map is right, offset from divider on left */
+
+		:global(.leaflet-control-scale),
+		:global(.leaflet-control-zoom) {
+			margin-left: 16px !important;
+		}
+
+
+	/* TileProviderSelector is now inside .hunter-panel-bottom */
+
+/*	.show-all-marker-icon {
+		display: flex;
+		align-items: center;
+	}
+
+	.show-all-marker-icon :global(.photo-marker-icon) {
+		width: 32px;
+		height: 32px;
+	}
+
+	.show-all-marker-icon.grayed :global(.bearing-circle) {
+		filter: grayscale(1);
+		opacity: 0.35;
+	}
+*/
+
+	.filters-button {
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		gap: 1px;
+		padding: 6px 8px;
+		border: 1px solid #ccc;
+		border-radius: 4px;
+		background-color: rgba(255, 255, 255, 0.9);
+		font-size: 12;
+		font-weight: 500;
+		color: #374151;
+		cursor: pointer;
+		box-shadow: 0 2px 6px rgba(0, 0, 0, 0.15);
+		transition: all 0.15s ease;
+	}
+
+	.filters-button:hover {
+		background-color: white;
+		box-shadow: 0 3px 8px rgba(0, 0, 0, 0.2);
+	}
+
+	.filters-button.active {
+		background-color: #3b82f6;
+		border-color: #3b82f6;
+		color: white;
+	}
+
+/*	.filters-button.grayed {
+		background-color: rgba(255, 255, 255, 0.5);
+		color: rgba(155, 155, 155, 0.5) !important;
+	}
+
+	.filters-button.active.grayed {
+		background-color: rgba(59, 130, 246, 0.5);
+		border-color: rgba(59, 130, 246, 0.5);
+		color: rgba(155, 155,155, 0.5) !important;
+	}
+*/
+
+
+	.filters-button.active:hover {
+		background-color: #2563eb;
+	}
+
+	.filters-button-text.overridden {
+		text-decoration: line-through;
+	}
+
+	.filters-button-icon {
+		position: relative;
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+	}
+
+	.filters-button-icon.overridden::after {
+		content: '';
+		position: absolute;
+		left: -2px;
+		right: -2px;
+		top: 50%;
+		height: 2px;
+		background-color: currentColor;
+		transform: rotate(-20deg);
+		transform-origin: center;
+		pointer-events: none;
+	}
+
+	@container (max-width: 500px) {
+		.filters-button-text {
+			display: none;
+		}
+		.filters-button {
+			padding: 4px;
+		}
+	}
+
+	.attribution-info-button {
+		position: absolute;
+		bottom: 0px;
+		left: 15px;
+		z-index: 20000;
+		width: 32px;
+		height: 32px;
+		border: 1px solid #ccc;
+		border-radius: 4px;
+		background-color: rgba(255, 255, 255, 0.7);
+		cursor: pointer;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		box-shadow: 0 2px 5px rgba(0, 0, 0, 0.2);
+	}
+
+	@media (orientation: portrait) {
+		.attribution-info-button {
+			left: 6px;
+		}
+	}
+
+	.attribution-info-button:hover {
+		background-color: rgba(255, 255, 255, 0.9);
+	}
+
+	.attribution-popup {
+		position: absolute;
+		bottom: 2px;
+		left: 50px;
+		z-index: 300001;
+		max-width: 280px;
+		padding: 8px 12px;
+		background-color: rgba(255, 255, 255, 0.95);
+		border: 1px solid #ccc;
+		border-radius: 4px;
+		box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+		font-size: 11px;
+		line-height: 1.4;
+		cursor: pointer;
+	}
+
+	.attribution-popup :global(a) {
+		color: #0078a8;
+		text-decoration: none;
+	}
+
+	.attribution-popup :global(a:hover) {
+		text-decoration: underline;
+	}
+
+
+	:global(.line-endpoint) {
+		background: #4a90e2;
+		border: 2px solid white;
+		border-radius: 50%;
+		cursor: grab;
+	}
+
+	:global(.line-startpoint) {
+		background: #e24a4a;
+		border: 2px solid white;
+		border-radius: 50%;
+		cursor: grab;
+	}
+
+</style>

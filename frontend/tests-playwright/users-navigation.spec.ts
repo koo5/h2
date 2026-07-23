@@ -1,0 +1,148 @@
+import { test, expect } from './fixtures';
+import { uploadTestPhotosWithLocation } from './helpers/photoUpload';
+import { loginAsTestUser } from './helpers/testUsers';
+import { collectErrors } from './helpers/consoleLogging';
+
+test.describe('Users Pages and Navigation', () => {
+
+  test('should load users list page and display user cards', async ({ page }) => {
+    await page.goto('/users');
+
+    // Check for users grid
+    await expect(page.locator('.users-grid')).toBeVisible();
+
+    // Check for user cards
+    const userCards = page.locator('[data-testid^="user-card-"]');
+    expect(await userCards.count()).toBeGreaterThan(0);
+
+    // Check first user card structure
+    const firstCard = userCards.first();
+    await expect(firstCard.locator('.user-photo')).toBeVisible();
+    await expect(firstCard.locator('.username')).toBeVisible();
+    await expect(firstCard.locator('.photo-count')).toBeVisible();
+  });
+
+  test('should navigate from users list to individual user page', async ({ page }) => {
+    await page.goto('/users');
+
+    const userCards = page.locator('[data-testid^="user-card-"]');
+    await expect(userCards.first()).toBeVisible();
+
+    // Click first user card
+    await userCards.first().click();
+
+    // Should navigate to user page
+    await page.waitForURL(/\/users\/[^\/]+$/);
+
+    // Wait for the user page to render either its photos or its empty state.
+    await page.locator('.photos-section, .empty-state').first().waitFor({ state: 'visible', timeout: 11*10000 });
+
+    // Wait for loading container to disappear (if it exists)
+    try {
+      await page.waitForSelector('.loading-container', { state: 'hidden', timeout: 11*5000 });
+    } catch {
+      // Loading container might not appear if page loads quickly
+    }
+
+    // Check that either photos section or empty state is visible
+    const hasPhotos = await page.locator('.photos-section').isVisible();
+    const isEmpty = await page.locator('.empty-state').isVisible();
+    expect(hasPhotos || isEmpty).toBe(true);
+
+    // Back button should be visible in photos section, but not in empty state
+    if (hasPhotos) {
+      await expect(page.locator('.back-button')).toBeVisible();
+    }
+  });
+
+  test('should navigate from activity page usernames to user pages', async ({ page, testUsers }) => {
+    // Login first
+    await loginAsTestUser(page, testUsers.passwords.test);
+
+    // Navigate to activity page
+    await page.goto('/activity');
+    await expect(page.getByTestId('activity-loading')).toBeHidden({ timeout: 11*15000 });
+
+    // Look for username links in activity
+    const usernameLinks = page.locator('.username-link');
+    if (await usernameLinks.count() > 0) {
+      await usernameLinks.first().click();
+      await page.waitForURL(/\/users\/[^\/]+$/);
+      await expect(page.locator('.photos-section')).toBeVisible();
+    }
+  });
+
+  test('should make photos clickable to navigate to map', async ({ page, testUsers }) => {
+    // Login and ensure we have some photos
+    await loginAsTestUser(page, testUsers.passwords.test);
+
+    // Upload some test photos with location data for the test user
+    await uploadTestPhotosWithLocation(page, 2);
+
+    // Go to users page and click on test user
+    await page.goto('/users');
+    await expect(page.locator('.users-grid')).toBeVisible({ timeout: 11*10000 });
+
+    const testUserCard = page.locator('[data-testid="user-card-test"]');
+    if (await testUserCard.count() > 0) {
+      await testUserCard.click();
+      await page.waitForURL(/\/users\/[^\/]+$/);
+
+      // Look for clickable photos with location data
+      const clickablePhotos = page.locator('.photo-card.clickable');
+      if (await clickablePhotos.count() > 0) {
+        await clickablePhotos.first().click();
+        // Should navigate to map with coordinates
+        await page.waitForURL(/\/\?.*lat=.*&lon=/);
+        await expect(page.locator('.leaflet-container')).toBeVisible();
+      }
+    }
+  });
+
+  test('should handle user page pagination', async ({ page }) => {
+    await page.goto('/users');
+    await expect(page.locator('.users-grid')).toBeVisible({ timeout: 11*10000 });
+
+    const userCards = page.locator('[data-testid^="user-card-"]');
+    if (await userCards.count() > 0) {
+      await userCards.first().click();
+      await page.waitForURL(/\/users\/[^\/]+$/);
+
+      // Check if load more button exists (indicates pagination)
+      const loadMoreButton = page.locator('.load-more-button');
+      if (await loadMoreButton.isVisible()) {
+        await loadMoreButton.click();
+        // Should load more photos without errors
+        await page.waitForTimeout(2000);
+        await expect(page.locator('.photos-grid')).toBeVisible();
+      }
+    }
+  });
+
+  test('should display user statistics correctly', async ({ page }) => {
+    await page.goto('/users');
+    await expect(page.locator('.users-grid')).toBeVisible({ timeout: 11*10000 });
+
+    // Check header shows user count
+    const header = page.locator('.users-grid h2');
+    const headerText = await header.textContent();
+    expect(headerText).toMatch(/All Users \(\d+\)/);
+
+    // Check user cards show photo counts
+    const userCards = page.locator('[data-testid^="user-card-"]');
+    if (await userCards.count() > 0) {
+      const photoCount = userCards.first().locator('.photo-count');
+      const photoCountText = await photoCount.textContent();
+      expect(photoCountText).toMatch(/\d+ photos?/);
+    }
+  });
+
+  test('should handle pages without runtime errors', async ({ page }) => {
+    const { errors } = collectErrors(page);
+
+    await page.goto('/users');
+    await page.waitForTimeout(1000);
+
+    expect(errors.length, `Found errors: ${errors.join(', ')}`).toBe(0);
+  });
+});

@@ -1,0 +1,176 @@
+name: hillview
+
+services:
+
+  postgres:
+    init: true
+    image: postgis/postgis:15-3.5
+    container_name: hillview_postgres
+    restart: always
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is required}
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER is required}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      # Removed POSTGRES_HOST_AUTH_METHOD: trust - use password auth instead
+    ports:
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-25432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/postgres/initdb.d:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:?POSTGRES_USER is required} -d ${POSTGRES_DB:?POSTGRES_DB is required}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+
+
+  api:
+    init: true
+    restart: always
+    build:
+      context: backend
+      dockerfile: api/app/Dockerfile
+    container_name: hillview_api
+    ports:
+      - "127.0.0.1:8055:8055"
+    volumes:
+      - pics:/app/pics
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:?POSTGRES_USER is required}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@${postgres:-postgres}:5432/${POSTGRES_DB:?POSTGRES_DB is required}
+      #- REDIS_URL=redis://redis:6379/0
+      - MAPILLARY_CLIENT_TOKEN_FILE=/run/secrets/mapillary_token
+      - SECRET_KEY=${SECRET_KEY:?SECRET_KEY is required}
+      - UPLOAD_DIR=/app/uploads
+      - PICS_DIR=/app/pics
+      - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-}
+      - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET:-}
+      - GITHUB_CLIENT_ID=${GITHUB_CLIENT_ID:-}
+      - GITHUB_CLIENT_SECRET=${GITHUB_CLIENT_SECRET:-}
+      # Canonical public base URL for OAuth callbacks (set in prod, unset in dev — see .env.example)
+      - API_BASE_URL=${API_BASE_URL:-}
+      - ENABLE_MAPILLARY_CACHE=${ENABLE_MAPILLARY_CACHE:-true}
+      - ENABLE_MAPILLARY_LIVE=${ENABLE_MAPILLARY_LIVE:-true}
+      - ACTIVITY_SHOW_AUTHORIZED_PHOTOS=${ACTIVITY_SHOW_AUTHORIZED_PHOTOS:-false}
+      - USER_ACCOUNTS=${USER_ACCOUNTS:-true}
+      - TEST_USERS=${TEST_USERS:-false}
+      - DEBUG_ENDPOINTS=${DEBUG_ENDPOINTS:-false}
+      - MODULE_NAME=app.api
+      - VARIABLE_NAME=app
+      - HOST=0.0.0.0
+      - PORT=8055
+      - DEV_MODE=${DEV_MODE:-}
+      - NO_LIMITS=${NO_LIMITS:-}
+      - WORKER_URL=${WORKER_URL:-http://localhost:8056}
+      - MAX_FILE_SIZE=${MAX_FILE_SIZE:-157286400}
+      - PICS_URL=${PICS_URL:-}
+      # Storage pool registry (JSON). Unset => single-pool fallback from PICS_URL/PICS_DIR (+ CDN env). See backend/CLAUDE.md.
+      - FILE_POOLS=${FILE_POOLS:-}
+      - BUCKET_NAME=${BUCKET_NAME:-}
+      - CDN_BASE_URL=${CDN_BASE_URL:-}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
+      - AWS_ENDPOINT_URL_S3=${AWS_ENDPOINT_URL_S3:-}
+      #- FIREBASE_CONFIG=${FIREBASE_CONFIG:/run/secrets/firebase_config}
+      - GOOGLE_APPLICATION_CREDENTIALS=/run/secrets/firebase_credentials
+      - FIREBASE_PROJECT_ID=${FIREBASE_PROJECT_ID:-}
+      - GOOGLE_CLOUD_PROJECT=${GOOGLE_CLOUD_PROJECT:-}
+    command: >
+      bash -c "cd /app/app && /app/prestart.sh && uvicorn api:app --host :: --port 8055 $${DEV_MODE:+--reload}"
+    secrets:
+      - mapillary_token
+#      - firebase_config
+      - firebase_credentials
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+
+  frontend:
+    init: true
+    restart: always
+    build:
+      context: frontend
+      dockerfile: Dockerfile
+    container_name: hillview_frontend
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      - NODE_ENV=production
+      - HOST=0.0.0.0
+      - PORT=3000
+      - VITE_BACKEND=${VITE_BACKEND:-http://localhost:8055/api}
+      - VITE_GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-}
+      - VITE_GOOGLE_REDIRECT_URI=${VITE_GOOGLE_REDIRECT_URI:-}
+      - VITE_GITHUB_CLIENT_ID=${GITHUB_CLIENT_ID:-}
+      - VITE_GITHUB_REDIRECT_URI=${VITE_GITHUB_REDIRECT_URI:-}
+      - VITE_FEATURE_USER_ACCOUNTS=${USER_ACCOUNTS:-true}
+      - VITE_DEV_MODE=${DEV_MODE:-false}
+      - VITE_SENTRY_ENABLED=${VITE_SENTRY_ENABLED:-false}
+      - VITE_SENTRY_DSN=${VITE_SENTRY_DSN:-}
+      - VITE_UMAMI_WEBSITE_ID=${VITE_UMAMI_WEBSITE_ID:-}
+      - VITE_UMAMI_URL=${VITE_UMAMI_URL:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      api:
+        condition: service_started
+
+
+  umami-init:
+    image: postgis/postgis:15-3.5
+    container_name: hillview_umami_init
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+    entrypoint: ["sh", "-c"]
+    command:
+      - >
+        psql -h postgres -U ${POSTGRES_USER} -d postgres -tc
+        "SELECT 1 FROM pg_database WHERE datname='umami'" | grep -q 1 ||
+        psql -h postgres -U ${POSTGRES_USER} -d postgres -c
+        "CREATE DATABASE umami"
+
+
+  umami:
+    image: ghcr.io/umami-software/umami@sha256:e3f80c0625aad7179b49da27d475357cabb1068b8cacd9a792cfd6966888b123
+#    image: ghcr.io/umami-software/umami:postgresql-latest
+    container_name: hillview_umami
+    restart: always
+    ports:
+      - "127.0.0.1:3344:3344"
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/umami
+      APP_SECRET: ${UMAMI_APP_SECRET:-replace-me-with-a-real-secret}
+      PORT: 3344
+    depends_on:
+      postgres:
+        condition: service_healthy
+      umami-init:
+        condition: service_completed_successfully
+
+
+volumes:
+  postgres_data:
+  uploads:
+  # NB: the `pics` volume is intentionally NOT defined here. The api service
+  # mounts it, so base alone is an invalid project ("undefined volume pics").
+  # An environment overlay (docker-compose.dev.yml / .prod.yml) must define it,
+  # which forces every launch to select an environment.
+
+
+secrets:
+  mapillary_token:
+      file: ./secrets/MAPILLARY_CLIENT_TOKEN
+  firebase_config:
+      file: ./secrets/FIREBASE_CONFIG.json
+  firebase_credentials:
+      file: ./secrets/firebase_credentials
+
+
+networks:
+  default:
+    name: hillview_network

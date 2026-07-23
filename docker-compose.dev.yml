@@ -1,0 +1,100 @@
+# Development overrides — use with: docker compose -f docker-compose.yml -f docker-compose.dev.yml up
+# Uses host networking so ufw controls LAN access (Docker-published ports bypass ufw)
+
+services:
+
+  # One-shot root container fixing volume ownership before api/worker start.
+  # Named volumes are created root-owned (and uids baked into rebuilt images
+  # can drift), while api and worker both run as non-root uid 1001 — first
+  # write then fails with "Permission denied" (photo uploads break with
+  # processing_status=error). find+chown only touches wrong-owner files, so
+  # repeated `up`s are cheap once ownership is correct.
+  volume-permissions:
+    image: busybox
+    volumes:
+      - uploads:/vols/uploads
+      - pics:/vols/pics
+      - pics2:/vols/pics2
+    command: sh -c 'find /vols ! -user 1001 -exec chown 1001:1001 {} +'
+
+  api:
+    network_mode: host
+    depends_on:
+      volume-permissions:
+        condition: service_completed_successfully
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@localhost:${POSTGRES_HOST_PORT:-25432}/${POSTGRES_DB}
+    volumes:
+      - ./backend/api/app:/app/app
+      - ./backend/common:/app/common
+      # Second storage pool for local dev (matches the "pics2" files pool in FILE_POOLS).
+      # Prod mounts its real second disk at the pool's path instead.
+      - pics2:/app/pics2
+
+  umami:
+    network_mode: host
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@localhost:${POSTGRES_HOST_PORT:-25432}/umami
+
+  frontend:
+    network_mode: host
+
+  worker:
+    init: true
+    restart: always
+    build:
+      context: backend
+      dockerfile: worker/Dockerfile
+      args:
+        MAGICK_MEMORY_LIMIT: ${MAGICK_MEMORY_LIMIT:-2GiB}
+        MAGICK_MAP_LIMIT: ${MAGICK_MAP_LIMIT:-4GiB}
+        MAGICK_DISK_LIMIT: ${MAGICK_DISK_LIMIT:-8GiB}
+        MAGICK_WIDTH_LIMIT: ${MAGICK_WIDTH_LIMIT:-65536}
+        MAGICK_HEIGHT_LIMIT: ${MAGICK_HEIGHT_LIMIT:-65536}
+        MAGICK_AREA_LIMIT: ${MAGICK_AREA_LIMIT:-1GP}
+    container_name: hillview_worker
+    network_mode: host
+    depends_on:
+      volume-permissions:
+        condition: service_completed_successfully
+    volumes:
+      - ./backend/worker:/app/worker
+      - ./backend/common:/app/common
+      - uploads:/app/uploads
+    environment:
+      #- MAGICK_TEMPORARY_PATH=/app/worker/tmp/
+      - UPLOAD_DIR=/app/uploads
+      - PICS_URL=${PICS_URL:-}
+      - MAX_FILE_SIZE=${MAX_FILE_SIZE:-157286400}
+      - MAX_IMAGE_WIDTH=${MAX_IMAGE_WIDTH:-32192}
+      - MAX_IMAGE_HEIGHT=${MAX_IMAGE_HEIGHT:-32192}
+      - MAX_IMAGE_PIXELS=${MAX_IMAGE_PIXELS:-167108864}
+      - WORKER_PORT=${WORKER_PORT:-8056}
+      - WORKER_HOST=0.0.0.0 # not used
+      - API_URL=${API_URL:-http://localhost:8055/api}
+      - DEV_MODE=${DEV_MODE:-}
+      # Opt-in retention of uploaded originals + intermediates after
+      # processing (debugging aid). Default: clean. Deliberately decoupled
+      # from DEV_MODE — see cleanup_file_on_error in common/file_utils.py.
+      - KEEP_UPLOADED_FILES=${KEEP_UPLOADED_FILES:-}
+      - BUCKET_NAME=${BUCKET_NAME:-}
+      - CDN_BASE_URL=${CDN_BASE_URL:-}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
+      - AWS_ENDPOINT_URL_S3=${AWS_ENDPOINT_URL_S3:-}
+      # OpenCV's EXR codec is disabled by default in opencv-python-headless
+      # (CVE-2022-34526 history). Set OPENCV_IO_ENABLE_OPENEXR=1 to allow
+      # cv2.imread to open .exr inputs. pyvips handles panorama EXRs on
+      # the happy path; this flag only matters for the cv2 fallback branch
+      # in read_image(). Default off.
+      - OPENCV_IO_ENABLE_OPENEXR=${OPENCV_IO_ENABLE_OPENEXR:-0}
+
+volumes:
+  # Defined per-environment (not in base) so base alone is unrunnable — see note
+  # in docker-compose.yml. Dev reuses the existing external `pics` volume.
+  pics:
+    external: true
+    name: pics
+  pics2:
+    external: true
+    name: pics2

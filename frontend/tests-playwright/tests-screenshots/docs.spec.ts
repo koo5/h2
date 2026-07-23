@@ -1,0 +1,245 @@
+import { test, type Page } from '@playwright/test';
+import path from 'node:path';
+import fs from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { ensureHunterMode } from '../helpers/sourceHelpers';
+import { SCREENSHOT_FIXTURE_INFO_PATH } from '../helpers/globalSetupScreenshots';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+/**
+ * Docs screenshots.
+ *
+ * Produces imagery for:
+ *   - docs/USER_GUIDE.md
+ *   - marketing / landing pages
+ *   - play store listing (web equivalents; real android shots still come from emulator)
+ *
+ * Each test runs once per viewport project defined in
+ * playwright.screenshots.config.ts. Files land in:
+ *   docs/screenshots/<project>/<name>.png
+ *
+ * The HERO shots focus on the annotated panorama — that is the primary
+ * value proposition of Hillview. Technical shots support the detailed
+ * sections of the guide.
+ */
+
+// The flagship annotated panorama (Vyhlídka Prosecké skály - východ).
+// This URL is the one we hand out to new visitors. With MOCK_SCREENSHOTS_DATA=1,
+// the photo uid points at the fixture seeded by globalSetupScreenshots; otherwise
+// at the production photo on hillview.cz. Coords match the fixture's EXIF GPS.
+const HERO_PHOTO_UID = resolveHeroPhotoUid();
+const HERO_PANORAMA_URL =
+  `/?lat=50.11691142317276&lon=14.488375782966616&zoom=20&bearing=139.06&photo=${HERO_PHOTO_UID}`;
+
+function resolveHeroPhotoUid(): string {
+  if (process.env.MOCK_SCREENSHOTS_DATA === '1') {
+    const data = JSON.parse(fs.readFileSync(SCREENSHOT_FIXTURE_INFO_PATH, 'utf8'));
+    if (!data.photoId) {
+      throw new Error(`Missing photoId in ${SCREENSHOT_FIXTURE_INFO_PATH}`);
+    }
+    return `hillview-${data.photoId}`;
+  }
+  return 'hillview-333e8851-c59b-4133-bce5-2d1ddc2ce335';
+}
+
+const OUT_ROOT = process.env.SCREENSHOT_OUT_DIR
+  ? path.resolve(process.env.SCREENSHOT_OUT_DIR)
+  : path.resolve(__dirname, '../../../docs/screenshots');
+
+function outPath(project: string, name: string): string {
+  const dir = path.join(OUT_ROOT, project);
+  fs.mkdirSync(dir, { recursive: true });
+  return path.join(dir, `${name}.png`);
+}
+
+async function shot(page: Page, project: string, name: string, fullPage = false) {
+  await page.screenshot({
+    path: outPath(project, name),
+    fullPage,
+    animations: 'disabled',
+  });
+}
+
+/** Wait for the map + photo split view to be visually settled. */
+async function waitForMapView(page: Page) {
+  await page.waitForSelector('.leaflet-container', { timeout: 11*15_000 });
+  // Let tiles, photo, and any annotorious overlays render.
+  await page.waitForTimeout(2500);
+}
+
+/** Wait for a plain content page (no map). */
+async function waitForContent(page: Page) {
+  await page.waitForTimeout(800);
+}
+
+// ---------------------------------------------------------------------------
+// HERO SHOTS — annotated panorama
+// ---------------------------------------------------------------------------
+
+test.describe('hero', () => {
+  test('annotated panorama — first-visit view', async ({ page }, testInfo) => {
+    const project = testInfo.project.name;
+    await page.goto(HERO_PANORAMA_URL);
+    await waitForMapView(page);
+    await shot(page, project, 'hero-panorama');
+  });
+
+  test('annotated panorama — zoom view', async ({ page }, testInfo) => {
+    const project = testInfo.project.name;
+    await page.goto(HERO_PANORAMA_URL);
+    await waitForMapView(page);
+    // Tap the photo to open the OSD zoom view.
+    await page.locator('[data-testid="main-photo"].front').click();
+    await page.locator('[data-testid="osd-viewer-overlay"]').waitFor({ state: 'visible', timeout: 11*10_000 });
+    // Let OSD fully render tiles + annotations.
+    await page.waitForTimeout(2000);
+    // Zoom in a bit via scroll wheel in the centre of the viewer.
+    // Zoom in — use OSD's built-in keyboard zoom (+ key).
+    // Works on both desktop and mobile emulation.
+    for (let i = 0; i < 5; i++) {
+      await page.keyboard.press('+');
+      await page.waitForTimeout(200);
+    }
+    await page.waitForTimeout(1500);
+    await shot(page, project, 'hero-panorama-full');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// TECHNICAL SHOTS — for the detailed guide sections
+// ---------------------------------------------------------------------------
+
+test.describe('guide', () => {
+  test('login page', async ({ page }, testInfo) => {
+    const project = testInfo.project.name;
+    await page.goto('/login');
+    await waitForContent(page);
+    await shot(page, project, '03-login-page');
+  });
+
+  test('activity feed', async ({ page }, testInfo) => {
+    const project = testInfo.project.name;
+    await page.goto('/activity');
+    await waitForContent(page);
+    await shot(page, project, '06-activity-feed');
+  });
+
+  test('best of', async ({ page }, testInfo) => {
+    const project = testInfo.project.name;
+    await page.goto('/bestof');
+    await waitForContent(page);
+    await shot(page, project, '07-best-of');
+  });
+
+  test('settings', async ({ page }, testInfo) => {
+    const project = testInfo.project.name;
+    await page.goto('/settings');
+    await waitForContent(page);
+    await shot(page, project, '08-settings');
+  });
+
+  test('about', async ({ page }, testInfo) => {
+    const project = testInfo.project.name;
+    await page.goto('/about');
+    await waitForContent(page);
+    await shot(page, project, '09-about-page');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// CAPTURE SHOTS — camera and external camera workflow
+// ---------------------------------------------------------------------------
+
+test.describe('capture', () => {
+  test('camera capture view', async ({ page }, testInfo) => {
+    const project = testInfo.project.name;
+    // Enable fake camera via localStorage before navigating.
+    await page.goto('/');
+    await page.evaluate(() => localStorage.setItem('fakeCamera', 'true'));
+    await page.goto('/');
+    await waitForMapView(page);
+    await page.locator('[data-testid="camera-button"]').click();
+    // Wait for the capture UI to render with the fake canvas.
+    await page.waitForTimeout(1500);
+    await shot(page, project, '10-camera-capture');
+  });
+
+  test('qr timestamp page', async ({ page }, testInfo) => {
+    const project = testInfo.project.name;
+    await page.goto('/settings/advanced/qr-timestamp');
+    await page.locator('[data-testid="qr-timestamp-page"]').waitFor({ state: 'visible', timeout: 11*10_000 });
+    await page.waitForTimeout(1000);
+    await shot(page, project, '11-qr-timestamp');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// HUNTING SHOTS — lines / triangulation
+// ---------------------------------------------------------------------------
+
+test.describe('hunting', () => {
+  test('bearing lines on map', async ({ page }, testInfo) => {
+    const project = testInfo.project.name;
+    // Seed two bearing lines from Prosecké skály pointing toward distant towns.
+    const lines = [
+      {
+        label: 'Říčany',
+        start: { lat: 50.117, lng: 14.488 },
+        end: { lat: 49.99, lng: 14.66 },
+        visible: true,
+      },
+      {
+        label: 'Uhříněves',
+        start: { lat: 50.117, lng: 14.488 },
+        end: { lat: 50.03, lng: 14.60 },
+        visible: true,
+      },
+    ];
+    await page.goto(HERO_PANORAMA_URL);
+    await page.evaluate((data) => {
+      localStorage.setItem('lines', JSON.stringify(data));
+      localStorage.setItem('linesVisible', 'true');
+    }, lines);
+    await page.reload();
+    await waitForMapView(page);
+    // Zoom out so both lines are visible.
+    for (let i = 0; i < 7; i++) {
+      await page.locator('.leaflet-control-zoom-out').click();
+      await page.waitForTimeout(300);
+    }
+    // Let the photo worker re-query for the wider viewport and markers render.
+    await page.waitForTimeout(3000);
+    // Open lines panel.
+    await page.locator('[data-testid="lines-button"]').click();
+    await page.locator('[data-testid="lines-view"]').waitFor({ state: 'visible', timeout: 11*5_000 });
+    await page.waitForTimeout(500);
+    await shot(page, project, '12-bearing-lines');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// INTERACTIVE STATES — menus / modals opened
+// ---------------------------------------------------------------------------
+
+test.describe('interactive', () => {
+  test('navigation menu opened', async ({ page }, testInfo) => {
+    const project = testInfo.project.name;
+    await page.goto('/');
+    await waitForMapView(page);
+    // Fails the spec (and therefore the run) if the selector doesn't resolve.
+    await page.locator('[data-testid="hamburger-menu"]').click();
+    await page.waitForTimeout(500);
+    await shot(page, project, '02-navigation-menu');
+  });
+
+  test('filters modal opened', async ({ page }, testInfo) => {
+    const project = testInfo.project.name;
+    await page.goto('/');
+    await waitForMapView(page);
+    await ensureHunterMode(page, true);
+    await page.locator('[data-testid="filters-button"]').click();
+    await page.waitForTimeout(500);
+    await shot(page, project, '05-filters-modal');
+  });
+});

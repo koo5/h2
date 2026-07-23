@@ -1,0 +1,7 @@
+secrets
+../.env
+fly.toml
+worker/Dockerfile.fly
+worker/tmp*
+worker/hillview_anon_*
+worker/Ultralytics

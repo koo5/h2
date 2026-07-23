@@ -1,0 +1,1186 @@
+#!/usr/bin/env python3
+"""
+Debug utilities using the centralized API client.
+"""
+
+import os
+import sys
+import json
+import traceback
+from dataclasses import dataclass
+from contextlib import contextmanager
+from datetime import datetime, timezone
+import requests
+from .api_client import api_client
+from .auth_utils import auth_helper
+import asyncio
+from .secure_upload_utils import SecureUploadClient, WorkerUnavailableError
+from .test_utils import wait_for_photo_processing, API_URL
+
+
+def tprint(*args, **kwargs):
+	"""Print with timestamp prefix."""
+	ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+	print(f"[{ts}]", *args, **kwargs)
+
+
+def _describe_exc(e: BaseException) -> str:
+	"""One-line, never-empty description of an exception.
+
+	httpx timeout/transport errors (ReadTimeout, ConnectError, ...) stringify
+	to '' — the cause rides on the class name, not the message — so a bare
+	``str(e)`` yields a useless empty string (the "❌ Error:" with nothing
+	after it). Always keep the type name; append the message when there is one.
+	"""
+	msg = (getattr(e, "message", None) or str(e) or "").strip()
+	return f"{type(e).__name__}: {msg}" if msg else type(e).__name__
+
+
+def _maybe_traceback() -> None:
+	"""Print the full traceback only when HILLVIEW_UPLOAD_DEBUG is set.
+
+	Upload failures are overwhelmingly transport-level (timeouts, 503s, resets)
+	where the 60-line httpx/httpcore stack is pure noise and never names the
+	real cause — ``_describe_exc`` already does. Set HILLVIEW_UPLOAD_DEBUG=1
+	to restore the full stack for genuine debugging.
+	"""
+	if os.environ.get("HILLVIEW_UPLOAD_DEBUG"):
+		traceback.print_exc()
+
+
+@contextmanager
+def backend_test_lock(shared: bool = False):
+	"""Take the per-API-server backend lock (see `tests/lock_util.py`).
+
+	Same lock the pytest session fixture in `tests/conftest.py` holds, so
+	debug commands and test runs won't step on each other. Scoped to the
+	effective API server: the lock file derives from $API_URL at acquire
+	time, so an `--api-url` override (which sets the env var before this
+	runs) locks that server, not the default one.
+
+	`shared=True` is for additive operations (uploads): shared holders
+	overlap each other freely but still exclude — and are excluded by —
+	exclusive holders (test runs, destructive commands). An exclusive
+	acquirer waits for the whole in-flight shared stream to drain.
+
+	Blocks indefinitely; interrupt with Ctrl-C to abort.
+	"""
+	import lock_util  # tests/ is on PYTHONPATH via debug.sh
+	with lock_util.BackendLock(shared=shared):
+		yield
+
+
+def debug_photos():
+	"""Debug user's photos."""
+	try:
+		# Get test user token
+		token = auth_helper.get_test_user_token("test")
+
+		# Get photos
+		photos_data = api_client.get_photos(token)
+		photos = photos_data.get('photos', [])
+		counts = photos_data.get('counts', {})
+
+		print("📸 Photo Summary:")
+		print(f"   Total: {counts.get('total', len(photos))}")
+		print(f"   Completed: {counts.get('completed', 0)}")
+		print(f"   Failed: {counts.get('failed', 0)}")
+		print(f"   Authorized: {counts.get('authorized', 0)}")
+
+		# Show error photos
+		error_photos = api_client.get_error_photos(token)
+		if error_photos:
+			print(f"\n🚨 {len(error_photos)} photos with errors:")
+			for photo in error_photos:
+				print(f"   {photo['id']}: {photo.get('error', 'no error message')}")
+				print(f"      Filename: {photo.get('original_filename', 'unknown')}")
+				print(f"      Uploaded: {photo.get('uploaded_at', 'unknown')}")
+
+		# Show recent photos
+		if photos:
+			print("\n📋 Recent photos:")
+			for photo in photos[:5]:
+				status = photo.get('processing_status', 'unknown')
+				filename = photo.get('original_filename', 'unknown')
+				print(f"   {photo['id'][:8]}... - {status} - {filename}")
+
+	except Exception as e:
+		print(f"❌ Error: {e}")
+
+
+def debug_photo_details(photo_id: str):
+	"""Get detailed photo info."""
+	try:
+		token = auth_helper.get_test_user_token("test")
+		photo = api_client.get_photo_details(photo_id, token)
+
+		print(f"📸 Photo {photo_id}:")
+		print(f"   Status: {photo.get('processing_status', 'unknown')}")
+		print(f"   Error: {photo.get('error', 'none')}")
+		print(f"   Filename: {photo.get('original_filename', 'unknown')}")
+		print(f"   Owner: {photo.get('owner_id', 'unknown')}")
+		print(f"   Uploaded: {photo.get('uploaded_at', 'unknown')}")
+
+		if photo.get('latitude') and photo.get('longitude'):
+			print(f"   Location: {photo['latitude']}, {photo['longitude']}")
+		if photo.get('bearing'):
+			print(f"   Bearing: {photo['bearing']}°")
+		if photo.get('sizes'):
+			print(f"   Sizes: {list(photo['sizes'].keys())}")
+
+	except Exception as e:
+		print(f"❌ Error: {e}")
+
+
+def recreate_users():
+	"""Recreate test users."""
+	try:
+		print("recreate test users..")
+		result = api_client.recreate_test_users()
+		print("✅ Test users recreated")
+		details = result.get("details", {})
+		passwords = details.get("user_passwords", {})
+		for username, password in passwords.items():
+			print(f"   {username}: {password}")
+	except Exception as e:
+		print(f"❌ Error: {e}")
+
+
+def set_password(username: str, password: str):
+	"""Set password for a user."""
+	import asyncio
+	from sqlalchemy import select
+	from common.database import SessionLocal
+	from common.models import User
+	from common.auth_utils import get_password_hash
+
+	async def _set_password():
+		async with SessionLocal() as db:
+			result = await db.execute(select(User).where(User.username == username))
+			user = result.scalars().first()
+
+			if not user:
+				print(f"❌ User '{username}' not found")
+				return
+
+			user.hashed_password = get_password_hash(password)
+			await db.commit()
+			print(f"✅ Password set for user '{username}'")
+
+	try:
+		asyncio.run(_set_password())
+	except Exception as e:
+		print(f"❌ Error: {e}")
+		traceback.print_exc()
+
+
+def cleanup_photos():
+	"""Clean up user's photos."""
+	try:
+		token = auth_helper.get_test_user_token("test")
+		count = api_client.cleanup_user_photos(token)
+		print(f"🗑️ Deleted {count} photos")
+	except Exception as e:
+		print(f"❌ Error: {e}")
+
+
+def setup_mock_mapillary():
+	"""Set up mock Mapillary data for browser testing."""
+	import math
+
+	try:
+		# Clear database first to avoid cache/mock confusion
+		print("🗑️ Clearing database (including Mapillary cache)...")
+		clear_db_result = api_client.clear_database()
+		print(f"✓ {clear_db_result['message']}")
+		print(f"   Deleted {clear_db_result['details']['mapillary_cache_deleted']} cached photos")
+		print(f"   Deleted {clear_db_result['details']['cached_regions_deleted']} cached areas")
+
+		# Clear existing mock data
+		print("🧹 Clearing existing mock data...")
+		clear_result = api_client.clear_mock_mapillary_data()
+		print(f"✓ {clear_result['message']}")
+
+		# Create mock data around Prague coordinates (same as tests)
+		print("📍 Creating mock Mapillary data...")
+		center_lat = (50.114739147066835 + 50.114119952930224) / 2  # ~50.11443
+		center_lng = (14.523099660873413 + 14.523957967758179) / 2  # ~14.5235
+
+		base_latitude = center_lat
+		base_longitude = center_lng
+		photos = []
+
+		for i in range(1, 16):  # 1 to 15 inclusive
+			# Distribute photos in a circle around center
+			angle = (i * 24) % 360
+			distance = 0.0001 * ((i % 3) + 1)  # Very small distances
+			lat_offset = distance * math.sin(angle * math.pi / 180)
+			lng_offset = distance * math.cos(angle * math.pi / 180)
+
+			photos.append({
+				'id': f"mock_mapillary_{i:03d}",
+				'geometry': {
+					'type': "Point",
+					'coordinates': [base_longitude + lng_offset, base_latitude + lat_offset]
+				},
+				'bearing': (i * 24) % 360,
+				'computed_bearing': (i * 24) % 360,
+				'computed_rotation': 0.0,
+				'sequence_id': f"mock_sequence_{(i-1)//5 + 1}",
+				'captured_at': f"2023-07-{10+i:02d}T12:00:00Z",
+				'organization_id': "mock_org_001"
+			})
+
+		mock_data = {'data': photos}
+		set_result = api_client.set_mock_mapillary_data(mock_data)
+		print(f"✅ {set_result['message']}")
+		print(f"   Mock photos: {set_result['details']['photos_count']}")
+
+		# Show cache info and warnings
+		cache_info = set_result['details']['cache_info']
+		print(f"   Cached photos: {cache_info['cached_photos']}")
+		print(f"   Cached areas: {cache_info['cached_areas']}")
+		if cache_info.get('warning'):
+			print(f"⚠️  {cache_info['warning']}")
+
+		print(f"   Center: {center_lat:.6f}, {center_lng:.6f}")
+		print()
+		print("🗺️ To test in browser:")
+		print("   1. Open your frontend app in browser")
+		print("   2. Navigate to the map")
+		print("   3. Enable Mapillary source in source buttons")
+		print("   4. Pan around Prague center to see mock photos")
+		print(f"   5. Good test area: lat={center_lat:.4f}, lng={center_lng:.4f}")
+		print()
+		print("💡 Testing tip: Mock data only works when no cached data exists.")
+		print("   If you see real Mapillary photos, cached data is being used instead.")
+
+	except Exception as e:
+		print(f"❌ Error: {e}")
+
+
+def clear_mock_mapillary():
+	"""Clear mock Mapillary data."""
+	try:
+		result = api_client.clear_mock_mapillary_data()
+		print(f"✅ {result['message']}")
+	except Exception as e:
+		print(f"❌ Error: {e}")
+
+
+def verify_signature(message_json: str, signature_base64: str, public_key_pem: str):
+	"""Verify an ECDSA signature given message JSON, signature, and public key."""
+	try:
+		# Import the verification function from common
+		sys.path.insert(0, '.')
+		from common.security_utils import verify_ecdsa_signature
+
+		# Parse the message JSON
+		message_data = json.loads(message_json)
+
+		print("🔐 Verifying ECDSA signature...")
+		print(f"   Message: {message_json[:100]}{'...' if len(message_json) > 100 else ''}")
+		print(f"   Signature: {signature_base64[:50]}...")
+		print(f"   Public key: {public_key_pem[:50]}...")
+
+		# Verify the signature
+		is_valid = verify_ecdsa_signature(signature_base64, public_key_pem, message_data)
+
+		if is_valid:
+			print("✅ Signature is VALID")
+		else:
+			print("❌ Signature is INVALID")
+
+		return is_valid
+
+	except json.JSONDecodeError as e:
+		print(f"❌ Invalid JSON message: {e}")
+		return False
+	except Exception as e:
+		print(f"❌ Error: {e}")
+		return False
+
+
+def base64_to_pem(base64_key: str):
+	"""Convert base64-encoded public key (from Android log) to PEM format and show fingerprint."""
+	try:
+		sys.path.insert(0, '.')
+		from common.security_utils import generate_client_key_id
+
+		# Remove any whitespace/newlines from the base64
+		base64_clean = base64_key.strip().replace('\n', '').replace(' ', '')
+
+		# Chunk into 64-char lines (standard PEM format)
+		lines = [base64_clean[i:i+64] for i in range(0, len(base64_clean), 64)]
+		formatted = '\n'.join(lines)
+
+		# Create PEM
+		pem = f"-----BEGIN PUBLIC KEY-----\n{formatted}\n-----END PUBLIC KEY-----"
+
+		print("📜 PEM format:")
+		print(pem)
+		print()
+
+		# Calculate fingerprint
+		fingerprint = generate_client_key_id(pem)
+		print(f"🔑 Key fingerprint (key_id): {fingerprint}")
+
+		return pem, fingerprint
+
+	except Exception as e:
+		print(f"❌ Error: {e}")
+		return None, None
+
+
+@dataclass
+class UploadParams:
+	"""Per-batch settings threaded through _parallel_upload to authorize-upload
+	and the worker. Bundled into one object so callers — and the call graph —
+	don't pass a dozen loose kwargs. Per-photo ``description`` stays in the items
+	tuple instead, since upload_random_photos varies it per image."""
+	license: str = None              # authorize-upload; None = client default
+	version: int = None              # authorize-upload; bump to re-upload
+	title: str = None                # authorize-upload (concise headline)
+	keywords: list = None            # authorize-upload (search synonyms)
+	anonymization_override: str = None  # worker; None=auto, "[]"=skip
+	quality: int = None              # worker WebP quality (1-100)
+	fast: bool = False               # worker fast path
+	metadata: str = None             # worker BrowserMetadata JSON (EXR geo etc.)
+
+
+async def _parallel_upload(items, parallel, get_image_data, token_or_manager, format_success, timeout=60, get_captured_at=None, params=None):
+	"""Core parallel upload logic.
+
+	Args:
+		items: List of (index, filename, description, extra_data) tuples
+		parallel: Number of concurrent uploads
+		get_image_data: Callable(extra_data) -> (bytes, lat, lon)
+		token_or_manager: Auth token string or TokenManager instance
+		format_success: Callable(index, total, filename, photo_data, extra_data) -> str
+		timeout: Processing timeout per photo
+		params: UploadParams bundle of per-batch authorize/worker settings.
+		get_captured_at: Optional callable() -> str. If None, captured_at is omitted
+		                 and the worker extracts it from EXIF. For test images,
+		                 use generate_test_captured_at from secure_upload_utils.
+	"""
+	params = params or UploadParams()
+
+	def get_token():
+		if isinstance(token_or_manager, str):
+			return token_or_manager
+		return token_or_manager.get_token()
+
+	total = len(items)
+	results = {"created": 0, "duplicates": 0, "failed": 0, "skipped": 0}
+	failed_files = []
+	skipped_files = []
+	# Per-item record indexed by item.i so callers (notably upload_files →
+	# the upload-files CLI's --manifest) can pair each input path with its
+	# outcome. Filled in by upload_one before each return path; the bulk
+	# results dict above stays as the rolled-up summary for the log.
+	per_item: list[dict] = [{"status": "pending"} for _ in range(total)]
+	semaphore = asyncio.Semaphore(parallel)
+
+	# Register client keys ONCE before starting parallel uploads
+	# This avoids hammering the API with concurrent key registrations
+	upload_client = SecureUploadClient(api_url=API_URL)
+	client_keys = upload_client.generate_client_keys()
+	token = get_token()
+	tprint("  Registering client key...")
+	try:
+		await upload_client.register_client_key(token, client_keys)
+	except Exception as e:
+		# One-time gate before any per-file upload. If the backend can't be
+		# reached / doesn't answer within the HTTP timeout (classically: a
+		# thundering herd of concurrent uploaders saturating a single backend,
+		# e.g. when the startup stagger is dialed down), no file in this batch
+		# can be sent. Record the real cause against every item so the caller's
+		# manifest reads "failed — <cause>" instead of a bare "pending — ", and
+		# return cleanly rather than letting an empty-str() httpx timeout bubble
+		# up to the catch-all as "❌ Error:" + a 60-line transport traceback.
+		msg = (f"client key registration failed: {_describe_exc(e)} "
+			   f"(talking to {upload_client.api_url})")
+		tprint(f"  ✗ {msg} — failing all {total} file(s) in this batch")
+		_maybe_traceback()
+		for i, filename, _description, _extra in items:
+			per_item[i] = {"filename": filename, "status": "failed",
+						   "error": msg, "stage": "register_client_key"}
+		return per_item
+	tprint(f"  Starting {total} uploads with {parallel} parallel workers...")
+
+	async def upload_one(item):
+		i, filename, description, extra_data = item
+		async with semaphore:
+			try:
+				try:
+					image_data, lat, lon = get_image_data(extra_data)
+				except FileNotFoundError:
+					results["skipped"] += 1
+					skipped_files.append(filename)
+					per_item[i] = {"filename": filename, "status": "skipped",
+								   "reason": "file no longer exists"}
+					tprint(f"  [{i+1}/{total}] {filename} ⚠ file no longer exists, skipping")
+					return
+				token = get_token()
+
+				# For real files, omit captured_at - worker extracts from EXIF
+				# For test images, caller provides get_captured_at callable
+				captured_at = get_captured_at() if get_captured_at else None
+
+				authorize_kwargs = {}
+				if params.license is not None:
+					authorize_kwargs["license"] = params.license
+				auth_data = await upload_client.authorize_upload_with_params(
+					token, filename, len(image_data), lat, lon,
+					description, is_public=True, file_data=image_data,
+					captured_at=captured_at, version=params.version,
+					title=params.title, keywords=params.keywords,
+					**authorize_kwargs,
+				)
+
+				if auth_data.get("duplicate"):
+					tprint(f"  [{i+1}/{total}] {filename} ⏭ duplicate")
+					results["duplicates"] += 1
+					per_item[i] = {"filename": filename, "status": "duplicate",
+								   "photo_id": auth_data.get("photo_id")}
+					return
+
+				# Allow overriding the server-supplied worker URL via env var
+				worker_url_override = os.getenv("WORKER_URL")
+				if worker_url_override:
+					auth_data["worker_url"] = worker_url_override
+
+				result = await upload_client.upload_to_worker(image_data, auth_data, client_keys, filename, anonymization_override=params.anonymization_override, quality=params.quality, fast=params.fast, metadata=params.metadata)
+				photo_id = result.get('photo_id', auth_data.get('photo_id'))
+				worker_warnings = result.get('warnings') or []
+
+				photo_data = wait_for_photo_processing(photo_id, get_token(), timeout=timeout)
+				if photo_data['processing_status'] == 'completed':
+					results["created"] += 1
+					per_item[i] = {"filename": filename, "status": "created",
+								   "photo_id": photo_id}
+					tprint(format_success(i, total, filename, photo_data, extra_data))
+				else:
+					results["failed"] += 1
+					err_text = photo_data.get('error', 'Unknown error')
+					failed_files.append((filename, err_text))
+					per_item[i] = {"filename": filename, "status": "failed",
+								   "error": err_text, "stage": "worker"}
+					tprint(f"  [{i+1}/{total}] {filename} ✗ {err_text}")
+				for w in worker_warnings:
+					tprint(f"      ⚠ {w}")
+			except WorkerUnavailableError as e:
+				# Expected, self-explanatory failure: the message already names the
+				# worker URL and cause, so print it plainly without a traceback.
+				results["failed"] += 1
+				err_text = str(e)
+				failed_files.append((filename, err_text))
+				per_item[i] = {"filename": filename, "status": "failed",
+							   "error": err_text, "stage": "worker_unavailable"}
+				tprint(f"  [{i+1}/{total}] {filename} ✗ {err_text}")
+			except Exception as e:
+				results["failed"] += 1
+				err_text = _describe_exc(e)
+				failed_files.append((filename, err_text))
+				per_item[i] = {"filename": filename, "status": "failed",
+							   "error": err_text, "stage": "exception"}
+				tprint(f"  [{i+1}/{total}] {filename} ✗ {err_text}")
+				_maybe_traceback()
+
+	await asyncio.gather(*[upload_one(item) for item in items])
+
+	tprint(f"\n✅ Uploaded {results['created']}/{total} "
+		   f"({results['duplicates']} duplicates, {results['failed']} failed, {results['skipped']} skipped)")
+
+	if failed_files:
+		tprint(f"\n❌ Failed ({len(failed_files)}):")
+		for fname, err in failed_files:
+			tprint(f"  {fname}: {err}")
+	if skipped_files:
+		tprint(f"\n⚠ Skipped ({len(skipped_files)}):")
+		for fname in skipped_files:
+			tprint(f"  {fname}")
+
+	# Return per-item records so callers like upload_files can pair each
+	# input path with its outcome (used by the upload-files --manifest CLI
+	# flag and by Luigi's UploadWorkdir to drive the reflink-on-success +
+	# retry-on-failure logic). One entry per items[i], in the same order.
+	return per_item
+
+
+class TokenManager:
+	"""Manages auth tokens with automatic refresh."""
+
+	def __init__(self, user: str = None, password: str = None):
+		from .test_utils import API_URL
+		self.api_url = API_URL
+		self.user = user
+		self.password = password
+		self.access_token = None
+		self.refresh_token = None
+		self.expires_at = None
+		self._login()
+
+	def _login(self):
+		# Always do a real password login so we capture the refresh token +
+		# expiry, even on the credential-less path (which defaults to the
+		# shared `test` user). Long upload batches outlive a single access
+		# token (ACCESS_TOKEN_EXPIRE_MINUTES, default 100); the old test-user
+		# path kept only the access_token, so get_token() could never renew
+		# and a >100min batch 401'd partway through. Going through /auth/token
+		# (instead of auth_helper.get_test_user_token, which caches only the
+		# access_token) lets the existing _refresh() flow keep it alive.
+		user, password = self.user, self.password
+		if not (user and password):
+			from .auth_utils import TEST_CREDENTIALS
+			user = "test"
+			password = TEST_CREDENTIALS[user]
+		token_url = f"{self.api_url}/auth/token"
+		response = requests.post(
+			token_url,
+			data={"username": user, "password": password},
+			headers={"Content-Type": "application/x-www-form-urlencoded"}
+		)
+		if response.status_code != 200:
+			raise Exception(f"Login failed at {token_url}: {response.status_code} - {response.text}")
+		data = response.json()
+		self.access_token = data["access_token"]
+		self.refresh_token = data.get("refresh_token")
+		expires_str = data.get("expires_at")
+		self.expires_at = (
+			datetime.fromisoformat(expires_str.replace("Z", "+00:00"))
+			if expires_str else None
+		)
+
+	def get_token(self) -> str:
+		"""Get current token, refreshing if needed."""
+		# Refresh if expiring in less than 5 minutes. Both the credentialed
+		# and the default test-user path now carry a refresh token + expiry,
+		# so this renews mid-batch instead of letting the token lapse. The
+		# 5-min margin also covers the up-to-60s wait_for_photo_processing
+		# poll that runs after get_token() with the returned token.
+		if self.expires_at:
+			now = datetime.now(timezone.utc)
+			if (self.expires_at - now).total_seconds() < 300:
+				if self.refresh_token:
+					self._refresh()
+				else:
+					self._login()
+		return self.access_token
+
+	def _refresh(self):
+		print("🔄 Refreshing auth token...")
+		response = requests.post(
+			f"{self.api_url}/auth/refresh",
+			json={"refresh_token": self.refresh_token}
+		)
+		if response.status_code != 200:
+			print("⚠️ Refresh failed, re-logging in...")
+			self._login()
+			return
+		data = response.json()
+		self.access_token = data["access_token"]
+		self.refresh_token = data.get("refresh_token", self.refresh_token)
+		expires_str = data.get("expires_at")
+		if expires_str:
+			self.expires_at = datetime.fromisoformat(expires_str.replace("Z", "+00:00"))
+
+
+def _get_token(user: str = None, password: str = None) -> str:
+	"""Get auth token - either from provided credentials or test user."""
+	if user and password:
+		import requests
+		from .test_utils import API_URL
+		token_url = f"{API_URL}/auth/token"
+		response = requests.post(
+			token_url,
+			data={"username": user, "password": password},
+			headers={"Content-Type": "application/x-www-form-urlencoded"}
+		)
+		if response.status_code != 200:
+			raise Exception(f"Login failed at {token_url}: {response.status_code} - {response.text}")
+		return response.json()["access_token"]
+	else:
+		return auth_helper.get_test_user_token("test")
+
+
+def dump_photos(user: str = None, password: str = None):
+	"""Print the user's complete photo list as one JSON array on stdout.
+
+	Machine-readable export: paginates ``GET /photos`` with
+	``include_detections=true`` and emits the per-photo dicts verbatim
+	(``original_filename``, ``user_rating`` / ``rating_counts``,
+	``detected_objects``, ...). Progress goes to stderr so stdout stays pure
+	JSON. Consumed by the pics pipeline's ``apply_dev_ratings.py`` between a
+	checked dev upload and the prod upload — it applies the frontend ratings
+	and copies the dev-computed anonymization detections for reuse.
+
+	Failures exit non-zero with a one-line message naming the server (the
+	dispatch wraps this call) so the consuming script's ``check_output``
+	fails loudly and actionably instead of parsing garbage.
+	"""
+	from .test_utils import API_URL
+	who = repr(user) if user else "the shared 'test' user"
+	print(f"… dumping photos from {API_URL} (as {who})", file=sys.stderr)
+	token = _get_token(user, password)
+	photos: list = []
+	cursor = None
+	while True:
+		params = {"limit": 100, "include_detections": "true"}
+		if cursor:
+			params["cursor"] = cursor
+		response = requests.get(
+			f"{API_URL}/photos",
+			headers={"Authorization": f"Bearer {token}"},
+			params=params,
+			timeout=30,
+		)
+		response.raise_for_status()
+		data = response.json()
+		photos.extend(data.get("photos", []))
+		pagination = data.get("pagination", {})
+		if not pagination.get("has_more"):
+			break
+		cursor = pagination["next_cursor"]
+		print(f"… fetched {len(photos)} photos", file=sys.stderr)
+	json.dump(photos, sys.stdout)
+	print()
+
+
+def upload_random_photos(count: int = 10, parallel: int = 1, user: str = None, password: str = None, quality: int = None):
+	"""Upload photos with randomized locations and bearings."""
+	import asyncio
+	import random
+	from .image_utils import create_test_image_full_gps
+	from .secure_upload_utils import generate_test_captured_at
+
+	async def _upload():
+		tprint(f"📸 Uploading {count} random photos (parallelism: {parallel})...")
+
+		random.seed(42)
+		token_manager = TokenManager(user, password)
+
+		center_lat, center_lon = 50.08, 14.42
+		items = []
+		for i in range(count):
+			lat = center_lat + random.uniform(-0.05, 0.05)
+			lon = center_lon + random.uniform(-0.05, 0.05)
+			bearing = random.uniform(0, 360)
+			color = (random.randint(50, 255), random.randint(50, 255), random.randint(50, 255))
+			filename = f"random_photo_{i+1:03d}.jpg"
+			items.append((i, filename, f"Random test photo #{i+1}", (color, lat, lon, bearing)))
+
+		def gen_image(extra):
+			color, lat, lon, bearing = extra
+			return create_test_image_full_gps(400, 300, color, lat, lon, bearing), lat, lon
+
+		def format_success(i, total, filename, photo_data, extra):
+			_, lat, lon, bearing = extra
+			return f"  [{i+1}/{total}] {filename} ✓ lat={lat:.4f}, lon={lon:.4f}, bearing={bearing:.0f}°"
+
+		# Test images need fake captured_at since they don't have real EXIF
+		await _parallel_upload(items, parallel, gen_image, token_manager, format_success, timeout=30,
+							   get_captured_at=generate_test_captured_at, params=UploadParams(quality=quality))
+
+	try:
+		asyncio.run(_upload())
+	except Exception as e:
+		print(f"❌ Error: {_describe_exc(e)}")
+		_maybe_traceback()
+
+
+def upload_files(files: list, license: str, parallel: int = 1, user: str = None, password: str = None, skip_anonymization: bool = False, version: int = None, description: str = None, quality: int = None, fast: bool = False, metadata: str = None, manifest_path: str = None, title: str = None, keywords: list = None, anonymization_override: str = None):
+	"""Upload files from command line paths.
+
+	metadata: JSON string matching the worker's BrowserMetadata schema
+	(latitude/longitude/bearing/altitude/captured_at/orientation_code/location_source).
+	Use for formats that can't carry EXIF, e.g. EXR — feed via
+	`url_to_exif.py --json <url>`.
+
+	anonymization_override: JSON string forwarded to the worker's
+	anonymization_override form field — a detected_objects dict ({"objects":
+	[...], ...}) applies those precomputed detections verbatim instead of
+	running the detector. skip_anonymization wins over this when both are set.
+
+	license: License identifier sent to authorize-upload. Required — the CLI
+	rejects upload-files without --license, since the legal terms of an
+	upload are too important to default silently.
+
+	manifest_path: when set, after the run write a JSON file listing one
+	entry per input path with ``{"path", "filename", "status", ...}``.
+	``status`` is one of ``created`` / ``duplicate`` / ``failed`` /
+	``skipped`` / ``pending`` (the last is impossible under normal flow
+	but reserved as a tell that something never reached upload_one).
+	Used by the pipeline's UploadWorkdir Luigi task to drive its
+	reflink-on-success and retry-on-failure behavior.
+	"""
+	import asyncio
+	import json
+	import os
+
+	# Pre-parse once so we can seed authorize-upload's lat/lon from the
+	# metadata blob (the API stores these on the initial Photo row before
+	# the worker runs; without this they'd land as 0,0).
+	parsed_metadata = json.loads(metadata) if metadata else None
+	meta_lat = (parsed_metadata or {}).get('latitude', 0.0)
+	meta_lon = (parsed_metadata or {}).get('longitude', 0.0)
+	# Seed title/description/keywords from the metadata blob too — the pipeline
+	# ships these inside --metadata (the worker's BrowserMetadata schema has no
+	# such fields, so they reach the Photo row only via authorize-upload).
+	# Explicit CLI flags still win.
+	if description is None and parsed_metadata:
+		description = parsed_metadata.get('description') or None
+	if title is None and parsed_metadata:
+		title = parsed_metadata.get('title') or None
+	if keywords is None and parsed_metadata:
+		keywords = parsed_metadata.get('keywords') or None
+
+	per_item: list = []
+
+	async def _upload():
+		nonlocal per_item
+		anon_msg = " (anonymization skipped)" if skip_anonymization else ""
+		ver_msg = f" (version {version})" if version is not None else ""
+		qual_msg = f" (quality {quality})" if quality is not None else ""
+		fast_msg = " (fast mode)" if fast else ""
+		meta_msg = " (with metadata)" if metadata else ""
+		tprint(f"📸 Uploading {len(files)} files (parallelism: {parallel}){anon_msg}{ver_msg}{qual_msg}{fast_msg}{meta_msg}...")
+
+		token_manager = TokenManager(user, password)
+
+		items = [(i, os.path.basename(f), description, f) for i, f in enumerate(files)]
+
+		def read_file(filepath):
+			with open(filepath, 'rb') as f:
+				return f.read(), meta_lat, meta_lon
+
+		def format_success(i, total, filename, photo_data, extra):
+			lat = photo_data.get('latitude')
+			lon = photo_data.get('longitude')
+			bearing = photo_data.get('bearing')
+			if lat and lon:
+				loc = f" lat={lat:.4f}, lon={lon:.4f}"
+				if bearing:
+					loc += f", bearing={bearing:.0f}°"
+			else:
+				loc = ""
+			return f"  [{i+1}/{total}] {filename} ✓{loc}"
+
+		anon_override = "[]" if skip_anonymization else anonymization_override
+		params = UploadParams(
+			license=license, version=version, title=title, keywords=keywords,
+			anonymization_override=anon_override, quality=quality, fast=fast, metadata=metadata,
+		)
+		per_item = await _parallel_upload(items, parallel, read_file, token_manager, format_success, timeout=60, params=params)
+
+	try:
+		asyncio.run(_upload())
+	except Exception as e:
+		print(f"❌ Error: {_describe_exc(e)}")
+		_maybe_traceback()
+	finally:
+		# Best-effort manifest write — runs even on uncaught exception so
+		# the caller (Luigi task) at least sees partial results and can
+		# act on them. ``pending`` entries indicate items that never
+		# reached upload_one (early crash); the caller should treat them
+		# as failed for retry purposes.
+		if manifest_path:
+			try:
+				records = []
+				for i, f in enumerate(files):
+					base = per_item[i] if i < len(per_item) else {"status": "pending"}
+					records.append({"path": os.path.abspath(f), **base})
+				with open(manifest_path, "w") as mf:
+					json.dump(records, mf, indent=2)
+			except Exception as mf_err:
+				print(f"⚠ failed to write upload manifest to {manifest_path}: {mf_err}")
+
+
+def populate_photos(count: int = 4):
+	"""Populate the database with test Hillview photos at fixed Prague locations."""
+	import asyncio
+	from .image_utils import create_test_image_full_gps
+	from .secure_upload_utils import SecureUploadClient, generate_test_captured_at
+	from .test_utils import wait_for_photo_processing, API_URL
+
+	async def _populate():
+		tprint(f"📸 Creating {count} test Hillview photos...")
+
+		# Get auth token for test user
+		token = auth_helper.get_test_user_token("test")
+
+		upload_client = SecureUploadClient(api_url=API_URL)
+
+		# Test photo data: filename, color, lat, lon, bearing
+		photo_configs = [
+			("prague_castle.jpg", (255, 0, 0), 50.0755, 14.4378, 45.0),      # Red - Prague Castle
+			("old_town.jpg", (0, 255, 0), 50.0865, 14.4175, 90.0),           # Green - Old Town Square
+			("wenceslas_sq.jpg", (0, 0, 255), 50.0819, 14.4362, 135.0),      # Blue - Wenceslas Square
+			("charles_bridge.jpg", (255, 255, 0), 50.0870, 14.4208, 180.0),  # Yellow - Charles Bridge
+			("vysehrad.jpg", (255, 0, 255), 50.0643, 14.4178, 225.0),        # Magenta - Vysehrad
+			("petrin.jpg", (0, 255, 255), 50.0833, 14.3950, 270.0),          # Cyan - Petrin Hill
+		]
+
+		created = 0
+		for i in range(min(count, len(photo_configs))):
+			filename, color, lat, lon, bearing = photo_configs[i]
+
+			tprint(f"  Uploading {filename}...")
+
+			# Create image with full GPS data
+			image_data = create_test_image_full_gps(400, 300, color, lat, lon, bearing)
+
+			# Secure upload workflow
+			client_keys = upload_client.generate_client_keys()
+			await upload_client.register_client_key(token, client_keys)
+
+			# Test images need fake captured_at since they don't have real EXIF
+			auth_data = await upload_client.authorize_upload_with_params(
+				token, filename, len(image_data), lat, lon,
+				f"Test photo at {filename.replace('.jpg', '').replace('_', ' ')}",
+				is_public=True, file_data=image_data,
+				captured_at=generate_test_captured_at()
+			)
+
+			result = await upload_client.upload_to_worker(image_data, auth_data, client_keys, filename)
+			photo_id = result.get('photo_id', auth_data.get('photo_id'))
+
+			# Wait for processing
+			photo_data = wait_for_photo_processing(photo_id, token, timeout=30)
+			if photo_data['processing_status'] == 'completed':
+				created += 1
+				tprint(f"    ✓ {filename}: lat={photo_data.get('latitude'):.4f}, lon={photo_data.get('longitude'):.4f}, bearing={photo_data.get('bearing')}°")
+			else:
+				tprint(f"    ✗ {filename} failed: {photo_data.get('error', 'Unknown error')}")
+
+		tprint(f"\n✅ Created {created}/{count} test photos")
+
+	try:
+		asyncio.run(_populate())
+	except Exception as e:
+		print(f"❌ Error: {e}")
+
+
+def find_duplicate_md5s():
+	"""Find photos with duplicate MD5 hashes."""
+	import asyncio
+	from sqlalchemy import select, func
+	from common.database import SessionLocal
+	from common.models import Photo, User
+
+	async def _find():
+		async with SessionLocal() as db:
+			# Find MD5s that appear more than once
+			subquery = (
+				select(Photo.file_md5, func.count(Photo.id).label('count'))
+				.where(Photo.file_md5.isnot(None))
+				.group_by(Photo.file_md5)
+				.having(func.count(Photo.id) > 1)
+				.subquery()
+			)
+
+			# Get the actual photos with duplicate MD5s, joined with user
+			query = (
+				select(Photo.id, Photo.file_md5, Photo.original_filename, Photo.uploaded_at, User.username)
+				.join(User, Photo.owner_id == User.id)
+				.where(Photo.file_md5.in_(select(subquery.c.file_md5)))
+				.order_by(Photo.file_md5, Photo.uploaded_at)
+			)
+
+			result = await db.execute(query)
+			rows = result.all()
+
+			if not rows:
+				print("✅ No duplicate MD5 hashes found")
+				return
+
+			print(f"⚠️  Found {len(rows)} photos with duplicate MD5 hashes:\n")
+
+			current_md5 = None
+			for photo_id, file_md5, filename, uploaded_at, username in rows:
+				if file_md5 != current_md5:
+					if current_md5:
+						print()
+					print(f"MD5: {file_md5}")
+					current_md5 = file_md5
+				print(f"  {photo_id}  {username}  {filename}  ({uploaded_at})")
+
+	try:
+		asyncio.run(_find())
+	except Exception as e:
+		print(f"❌ Error: {e}")
+		traceback.print_exc()
+
+
+def set_analyses(distilled_json_path: str):
+	"""Set analysis data for photos from a distilled.json file."""
+	import requests
+	from .test_utils import API_URL
+
+	try:
+		with open(distilled_json_path, 'r') as f:
+			entries = json.load(f)
+
+		tprint(f"📊 Setting analysis for {len(entries)} photos...")
+
+		success = 0
+		not_found = 0
+		failed = 0
+
+		for entry in entries:
+			file_md5 = entry.get('original_file_md5')
+			if not file_md5:
+				tprint(f"  ⚠ Skipping entry without MD5")
+				continue
+
+			# Extract the fields we want to set
+			analysis = {}
+			for field in ['features', 'time_of_day', 'closest_object_distance', 'farthest_object_distance', 'location_type', 'scenic_score', 'visibility_distance', 'tallest_building']:
+				if field in entry:
+					analysis[field] = entry[field]
+
+			if not analysis:
+				continue
+
+			try:
+				response = requests.post(
+					f"{API_URL}/hillview/internal/set-analysis",
+					json={"file_md5": file_md5, "analysis": analysis}
+				)
+
+				if response.status_code == 200:
+					success += 1
+				elif response.status_code == 404:
+					not_found += 1
+				elif response.status_code == 409:
+					# Multiple photos with same MD5 - stop processing
+					detail = response.json().get('detail', 'Multiple photos found')
+					print(f"\n❌ {detail}")
+					print("Stopping - please resolve duplicate MD5 hashes before continuing.")
+					return
+				else:
+					failed += 1
+					tprint(f"  ✗ MD5 {file_md5[:16]}... failed: {response.status_code}")
+			except Exception as e:
+				failed += 1
+				tprint(f"  ✗ MD5 {file_md5[:16]}... error: {e}")
+
+		tprint(f"\n✅ Set analysis: {success} success, {not_found} not found, {failed} failed")
+
+	except Exception as e:
+		print(f"❌ Error: {e}")
+		traceback.print_exc()
+
+
+def main():
+	"""Command-line interface."""
+	if len(sys.argv) < 2:
+		print("Usage:")
+		print("  python debug_utils.py recreate              # Recreate test users")
+		print("  python debug_utils.py set-password <user> <pass>  # Set user password")
+		print("  python debug_utils.py photos                # Show user's photos")
+		print("  python debug_utils.py photo <id>            # Show photo details")
+		print("  python debug_utils.py cleanup               # Delete user's photos")
+		print("  python debug_utils.py populate-photos       # Create test photos (fixed locations)")
+		print("  python debug_utils.py populate-photos 6     # Create N test photos (max 6)")
+		print("  python debug_utils.py upload-random-photos [N] [--parallel P] [--user U --pass P] [--quality Q]")
+		print("  python debug_utils.py upload-files --license L [...] file1.jpg ...  (run 'upload-files --help' for all flags)")
+		print("  python debug_utils.py dump-photos [--user U --pass P]  # full photo list (ratings + detections) as JSON on stdout")
+		print("  python debug_utils.py mock-mapillary        # Set up mock Mapillary data")
+		print("  python debug_utils.py clear-mapillary       # Clear mock Mapillary data")
+		print("  python debug_utils.py verify-signature <message_json> <signature_base64> <public_key_pem>")
+		print("                                              # Verify ECDSA signature")
+		print("  python debug_utils.py base64-to-pem <base64_key>")
+		print("                                              # Convert Android pubkey to PEM & show fingerprint")
+		print("  python debug_utils.py set-analyses <distilled.json>")
+		print("                                              # Set photo analysis from distilled.json")
+		print("  python debug_utils.py find-duplicate-md5s   # Find photos with duplicate MD5 hashes")
+		return
+
+	command = sys.argv[1]
+
+	if command == "recreate":
+		with backend_test_lock():
+			recreate_users()
+	elif command == "set-password":
+		if len(sys.argv) < 4:
+			print("Usage: set-password <username> <password>")
+		else:
+			with backend_test_lock():
+				set_password(sys.argv[2], sys.argv[3])
+	elif command == "photos":
+		debug_photos()
+	elif command == "photo" and len(sys.argv) > 2:
+		debug_photo_details(sys.argv[2])
+	elif command == "cleanup":
+		with backend_test_lock():
+			cleanup_photos()
+	elif command == "populate-photos":
+		count = int(sys.argv[2]) if len(sys.argv) > 2 else 4
+		with backend_test_lock():
+			populate_photos(count)
+	elif command == "upload-random-photos":
+		args = sys.argv[2:]
+		count, parallel, user, password, quality = 10, 1, None, None, None
+		positional = []
+		i = 0
+		while i < len(args):
+			if args[i] == "--parallel":
+				parallel = int(args[i + 1])
+				i += 2
+			elif args[i] == "--user":
+				user = args[i + 1]
+				i += 2
+			elif args[i] == "--pass":
+				password = args[i + 1]
+				i += 2
+			elif args[i] == "--quality":
+				quality = int(args[i + 1])
+				i += 2
+			elif args[i].startswith("--"):
+				print(f"Unknown option: {args[i]}")
+				return
+			else:
+				positional.append(args[i])
+				i += 1
+		if positional:
+			count = int(positional[0])
+		# shared: uploads are additive — overlap freely, exclude test runs.
+		with backend_test_lock(shared=True):
+			upload_random_photos(count, parallel, user, password, quality=quality)
+	elif command == "upload-files":
+		import argparse
+		# allow_abbrev=False keeps the old exact-flag behavior (no --ver→--version
+		# prefix matching). argparse gives `upload-files --help` and required/type
+		# checks for free, replacing the hand-rolled loop this used to be.
+		parser = argparse.ArgumentParser(
+			prog="debug.sh upload-files",
+			description="Upload image files through the secure three-phase workflow.",
+			allow_abbrev=False,
+		)
+		parser.add_argument("files", nargs="+", help="image file paths to upload")
+		parser.add_argument("--license", required=True,
+			help="license identifier sent to authorize-upload (required — the legal "
+			     "terms of an upload are too important to default silently)")
+		parser.add_argument("--parallel", type=int, default=1,
+			help="number of concurrent uploads (default: 1)")
+		parser.add_argument("--user", help="login username (default: the shared 'test' user)")
+		parser.add_argument("--pass", dest="password", help="login password (use with --user)")
+		parser.add_argument("--skip-anonymization", action="store_true",
+			help="skip face/plate anonymization (for noanon tagdirs)")
+		parser.add_argument("--anonymization-override",
+			help="JSON for the worker's anonymization_override field: a "
+			     "detected_objects dict (an 'objects' key) reuses precomputed "
+			     "detections verbatim instead of re-running the detector — the "
+			     "pics pipeline ships dev-computed detections to prod this way. "
+			     "--skip-anonymization wins if both are given. REQUIRES a worker "
+			     "that understands the 'objects' key; an older worker container "
+			     "would read it as an empty rectangle list and SKIP anonymization")
+		parser.add_argument("--fast", action="store_true",
+			help="skip pyramid / 640_llm / EXIF copy; fast WebP encode")
+		parser.add_argument("--version", type=int,
+			help="authorize-upload version; >1 allows re-uploading completed photos")
+		parser.add_argument("--title", help="concise photo title (headline)")
+		parser.add_argument("--description", help="photo description (longer body)")
+		parser.add_argument("--keyword", action="append", dest="keywords",
+			help="search keyword / alternate name (repeatable)")
+		parser.add_argument("--quality", type=int,
+			help="WebP quality 1-100 (default: worker's 97)")
+		parser.add_argument("--metadata",
+			help="JSON (BrowserMetadata schema) for formats without EXIF, e.g. EXR")
+		parser.add_argument("--manifest",
+			help="write a per-file JSON outcome manifest to this path")
+		parser.add_argument("--api-url", help="override the API base URL")
+		parser.add_argument("--worker-url",
+			help="override the worker URL returned by authorize-upload")
+		opts = parser.parse_args(sys.argv[2:])
+
+		# --api-url / --worker-url overrides.
+		#
+		# WORKER_URL is read lazily from os.environ inside upload_one, so
+		# setting the env var is enough to redirect it. API_URL is NOT lazy:
+		# test_utils.API_URL (and the copy imported into this module) is bound
+		# from os.getenv("API_URL") at import time — which already happened
+		# before main() runs — so setting os.environ here is too late. Rebind
+		# those module globals directly; tokens, client-key registration,
+		# photo polling and the upload client all resolve the API base
+		# through them.
+		if opts.api_url is not None:
+			os.environ["API_URL"] = opts.api_url
+			from . import test_utils as _test_utils
+			_test_utils.API_URL = opts.api_url
+			globals()["API_URL"] = opts.api_url
+		if opts.worker_url is not None:
+			os.environ["WORKER_URL"] = opts.worker_url
+
+		# shared: uploads are additive — overlap freely, exclude test runs.
+		with backend_test_lock(shared=True):
+			upload_files(opts.files, opts.license, opts.parallel, opts.user, opts.password,
+				skip_anonymization=opts.skip_anonymization, version=opts.version,
+				description=opts.description, quality=opts.quality, fast=opts.fast,
+				metadata=opts.metadata, manifest_path=opts.manifest,
+				title=opts.title, keywords=opts.keywords,
+				anonymization_override=opts.anonymization_override)
+	elif command == "dump-photos":
+		import argparse
+		parser = argparse.ArgumentParser(
+			prog="debug.sh dump-photos",
+			description="Print the user's full photo list (ratings + anonymization "
+			            "detections) as one JSON array on stdout.",
+			allow_abbrev=False,
+		)
+		parser.add_argument("--user", help="login username (default: the shared 'test' user)")
+		parser.add_argument("--pass", dest="password", help="login password (use with --user)")
+		parser.add_argument("--api-url", help="override the API base URL")
+		opts = parser.parse_args(sys.argv[2:])
+		if opts.api_url is not None:
+			# Same rebinding dance as upload-files: API_URL is bound at import.
+			os.environ["API_URL"] = opts.api_url
+			from . import test_utils as _test_utils
+			_test_utils.API_URL = opts.api_url
+			globals()["API_URL"] = opts.api_url
+		# No lock: read-only, like the `photos` command. One-line failure
+		# (server named by the messages above), non-zero exit — the consumer
+		# (pics apply_dev_ratings.py) needs loud-but-actionable, not a
+		# 20-frame traceback. DEBUG=1 restores the traceback.
+		try:
+			dump_photos(opts.user, opts.password)
+		except Exception as e:
+			print(f"❌ dump-photos: {_describe_exc(e)}", file=sys.stderr)
+			_maybe_traceback()
+			sys.exit(1)
+	elif command == "mock-mapillary":
+		with backend_test_lock():
+			setup_mock_mapillary()
+	elif command == "clear-mapillary":
+		with backend_test_lock():
+			clear_mock_mapillary()
+	elif command == "verify-signature":
+		if len(sys.argv) < 5:
+			print("Usage: verify-signature <message_json> <signature_base64> <public_key_pem>")
+			print("  message_json: JSON string of the message data")
+			print("  signature_base64: Base64-encoded ECDSA signature")
+			print("  public_key_pem: PEM-formatted ECDSA P-256 public key")
+			return
+		verify_signature(sys.argv[2], sys.argv[3], sys.argv[4])
+	elif command == "base64-to-pem":
+		if len(sys.argv) < 3:
+			print("Usage: base64-to-pem <base64_key>")
+			print("  base64_key: Base64-encoded public key from Android log")
+			print("              (the value logged by: Base64.encodeToString(publicKey.encoded, NO_WRAP))")
+			return
+		base64_to_pem(sys.argv[2])
+	elif command == "set-analyses":
+		if len(sys.argv) < 3:
+			print("Usage: set-analyses <distilled.json>")
+			return
+		with backend_test_lock():
+			set_analyses(sys.argv[2])
+	elif command == "find-duplicate-md5s":
+		find_duplicate_md5s()
+	else:
+		print(f"Unknown command: {command}")
+
+
+if __name__ == "__main__":
+	main()
