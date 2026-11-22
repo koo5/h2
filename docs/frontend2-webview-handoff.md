@@ -28,7 +28,7 @@ This preserves master and old refs. The source head can advance later; recheck i
 
 - **Keep maintaining the existing SvelteKit website** and its routes. No independent Svelte fork/copy under frontend2.
 - Eventually replace the Android Tauri app with the CMP app; tiny legacy Android user base means migration of its local preferences/tokens/queues is not a priority.
-- Keep map, capture, sensors, native upload machinery, and the authoritative map/location/bearing state in KMP/CMP.
+- Keep the **native map**, capture, sensors, native upload machinery, and the authoritative map/location/bearing state in KMP/CMP; the Android map engine can change later, independently of this WebView work. The **website map engine is not decided**.
 - Reuse simpler web UIs: **/bestof, /users, /users/[id], /activity**, likely **/about**, perhaps **/photos** eventually, and **photo details + OpenSeadragon zoom**.
 - **Do not bring along the Tauri runtime or Tauri plugin framework.** Introduce a narrow third platform implementation beside browser and Tauri only where the reused web code needs native capabilities.
 - Do not recreate all old routes, all old platform commands, or old Android storage migration.
@@ -56,6 +56,24 @@ This preserves master and old refs. The source head can advance later; recheck i
 - [frontend2/shared/src/commonMain/kotlin/cz/hillview/map/MapState.kt](https://github.com/koo5/hillview/blob/1020df5290ce67938a90b5e9f91ce70f9f847047/frontend2/shared/src/commonMain/kotlin/cz/hillview/map/MapState.kt) has MapStateHolder, the single state authority. Read docs/one-state.md and OneStateArchitectureTest before exposing map interactions to the bridge.
 - [frontend2/shared/src/commonMain/kotlin/cz/hillview/viewer/ViewerPane.kt](https://github.com/koo5/hillview/blob/1020df5290ce67938a90b5e9f91ce70f9f847047/frontend2/shared/src/commonMain/kotlin/cz/hillview/viewer/ViewerPane.kt): **native directional viewer already exists**. Keep it and use Svelte primarily for high-resolution OpenSeadragon zoom / photo detail instead of duplicating viewer state.
 - [frontend2/CLAUDE.md](https://github.com/koo5/hillview/blob/1020df5290ce67938a90b5e9f91ce70f9f847047/frontend2/CLAUDE.md): preserve one-state rule, shared-kt service ownership and existing build/test architecture contracts.
+
+## Map engines — a deliberately open, independent decision (2026-11-22)
+
+**Do not couple the map replacement to the WebView route reuse.** The new CMP app should own a native map; the Svelte website's map renderer is undecided and may remain Leaflet or change independently. Sharing MapLibre's *data/style concepts* can be useful, but using the same rendering library on the two platforms is **not** a requirement. The embedded web screens must communicate map destinations to the **native** CMP map instead of opening the old web map.
+
+The inspected `frontend2/shared/src/androidMain/kotlin/cz/hillview/map/MapScreen.android.kt` already uses a **native osmdroid MapView** through Compose AndroidView. `OsmMapView.kt` adapts the current XYZ raster tile provider palette; `PhotoMarkerOverlay.kt` draws the custom crosses, bearing arrows and roses and owns tap hit-testing. This is currently not a Leaflet WebView. The existing `MapStateHolder` is library-agnostic; keep it that way. However, osmdroid itself was archived on 2024-11-20, so it is an interim rather than ideal long-term engine.
+
+**Native candidate:** evaluate [MapLibre Compose](https://maplibre.org/maplibre-compose/) (as of November 2026 v0.20.0, pre-1.0 API) first, with direct [MapLibre Native Android](https://maplibre.org/maplibre-native/android/api/) as a fallback if Compose's marker/annotation APIs prove restrictive. MapLibre Compose targets Android/iOS/desktop and supports raster as well as vector sources, GPU-rendered styles and GeoJSON layers; check current release/compatibility with frontend2's Kotlin/Compose versions. The hard part will be faithfully replacing the custom `PhotoMarkerOverlay` drawing, bearing rotation, grouping and tap targets without sacrificing performance or the fixed **70-screen-pixel range circle** and `MapStateHolder` state contract. **Do not rewrite the map just to embed simple Svelte routes.**
+
+**Web candidates:** retain Leaflet until there's a measured problem; evaluate [MapLibre GL JS](https://maplibre.org/maplibre-gl-js/docs/guides/leaflet-migration-guide/) if rotation/vector styling or many photo markers motivate the change. It can still consume raster XYZ tiles. [OpenLayers](https://openlayers.org/) is another option if mixed raster/complex geospatial overlays matter more. Consider WebGL compatibility on older hardware and preserve a fallback if needed. `frontend/src/lib/components/Map.svelte` currently mixes Leaflet rendering with location/bearing and other application logic; first extract a map renderer adapter rather than attempt a direct 2,899-line port.
+
+### Separate map evaluation TODO (not a prerequisite for P0–P2)
+
+- [ ] Record the actual map-engine requirements: existing raster providers, vector style/terrain goals, map rotation, bearing and location cues, 70px range, layered photo markers, rose grouping, source filters, tap/long-press and hit testing, offline/cache behaviour, and memory/battery profile.
+- [ ] Prototype MapLibre Compose on **Android** behind the existing `expect/actual MapScreen` seam. Demonstrate raster XYZ basemap + a meaningful number of photo markers with heading arrows; benchmark gestures and panning, and test actual devices, not only emulators.
+- [ ] Port custom marker rendering/hit testing only if validated; make geo model/state independent of the renderer. Existing native osmdroid map remains working until replacement is feature-complete.
+- [ ] Evaluate MapLibre GL JS versus current Leaflet as a **separate website project** only after identifying what Leaflet is limiting. Existing web Map.svelte remains functional throughout.
+- [ ] Keep website maps and native maps linked through **domain intents** (lat/lon/zoom/bearing/photo UID), not shared renderer APIs or a synchronised JS map store.
 
 ## Proposed architecture
 
